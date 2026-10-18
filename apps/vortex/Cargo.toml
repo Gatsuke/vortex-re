@@ -1,0 +1,29 @@
+[package]
+name = "vortex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Vortex-RE command line interface and MCP server"
+
+[lib]
+name = "vortex_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vortex"
+path = "src/main.rs"
+
+[dependencies]
+vortex-core = { workspace = true }
+vortex-evidence = { workspace = true }
+vortex-providers = { workspace = true }
+vortex-service = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+rmcp = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
