@@ -99,18 +99,34 @@ Full details, run lifecycle, and design decisions: [docs/ARCHITECTURE.md](docs/A
 
 ## Prerequisites
 
-* A stable Rust toolchain (1.88+) to build. That's it — no Node.js, no
+* To use the prebuilt npm package on Linux x64: Node.js 16+ (only for the
+  launcher; the analysis binary itself is a static executable with no
+  runtime dependencies).
+* To build from source: a stable Rust toolchain (1.88+). No Node.js, no
   Python, no JVM, no reverse-engineering engines.
 * At runtime: nothing beyond the `vortex` binary.
 
 ## Build and install
 
+Install the prebuilt package (Linux x64 ships a fully static binary; other
+platforms build from the bundled source when a Rust toolchain is present):
+
 ```bash
-git clone <repository-url> vortex-re
+npm install -g vortex-re
+vortex doctor
+```
+
+Or build from source with a locked, reproducible dependency set:
+
+```bash
+git clone https://github.com/Gatsuke/vortex-re vortex-re
 cd vortex-re
 cargo build --release --locked
 # binary: target/release/vortex
 ```
+
+Prebuilt binaries for each release are also attached to
+https://github.com/Gatsuke/vortex-re/releases (with SHA-256 checksums).
 
 The lockfile is committed, so `--locked` builds are reproducible. For a
 debug build use `cargo build`; for tests see

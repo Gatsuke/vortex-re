@@ -1,0 +1,46 @@
+{
+  "name": "vortex-re",
+  "version": "0.1.0",
+  "description": "Local-first, AI-oriented reverse-engineering toolkit: evidence-backed static analysis of software you are authorized to inspect, with CLI and MCP interfaces. Inspected targets are never executed.",
+  "keywords": [
+    "reverse-engineering",
+    "static-analysis",
+    "mcp",
+    "model-context-protocol",
+    "ai-tools",
+    "cli",
+    "security",
+    "evidence",
+    "rust"
+  ],
+  "bin": {
+    "vortex": "bin/vortex.js",
+    "vortex-re": "bin/vortex.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/vortex.js",
+    "install.js",
+    "prebuilds/",
+    "rust-source/",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "MIT OR Apache-2.0",
+  "author": "Gatsuke",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gatsuke/vortex-re.git"
+  },
+  "homepage": "https://github.com/Gatsuke/vortex-re#readme",
+  "bugs": {
+    "url": "https://github.com/Gatsuke/vortex-re/issues"
+  }
+}
