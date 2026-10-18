@@ -4,6 +4,7 @@
 
 const { loadConfig } = require('./lib/config.js');
 const { checkForUpdates } = require('./lib/updater.js');
+const tinyDep = require('tiny-dep');
 const minimist = require('minimist');
 const fs = require('fs');
 

@@ -140,7 +140,9 @@ fn inspect_fixture_json_matches_expected_contract() {
     assert!(value["run_id"]
         .as_str()
         .is_some_and(|id| id.starts_with("run-")));
-    assert_eq!(value["report"]["summary"]["file_count"], 13);
+    // 15 files: the fixture ships a vendored node_modules/tiny-dep
+    // (package.json + lib/entry.js) alongside the original 13 files.
+    assert_eq!(value["report"]["summary"]["file_count"], 15);
     assert_eq!(value["report"]["summary"]["electron"], true);
     assert_eq!(
         value["report"]["summary"]["entry_point"]["entry_point"],
@@ -184,7 +186,7 @@ fn search_fixture_json_returns_expected_matches() {
             )
         })
         .collect();
-    assert!(matches.contains(&"src/main.js:10".to_string()));
+    assert!(matches.contains(&"src/main.js:11".to_string()));
     assert!(matches.contains(&"dist/bundle.js:1".to_string()));
 }
 
@@ -241,7 +243,9 @@ fn evidence_lifecycle_via_cli() {
     let view = stdout_json(&run.output);
     assert_eq!(view["section"], "findings");
     assert_eq!(view["page"]["page_size"], 3);
-    assert_eq!(view["page"]["total_items"], 7);
+    // 9 findings: the vendored tiny-dep adds a second package_manifest
+    // and a second entry_point finding to the original 7.
+    assert_eq!(view["page"]["total_items"], 9);
     assert_eq!(view["page"]["has_next"], true);
     assert_eq!(view["page"]["items"].as_array().unwrap().len(), 3);
 

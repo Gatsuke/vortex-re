@@ -54,8 +54,16 @@ The built-in provider works fully offline on ordinary files. It requires
 * Archive extraction (zip, asar, tar). Not implemented in this release;
   safe extraction needs its own threat-model pass (see
   `docs/THREAT_MODEL.md`).
-* Package `exports` map resolution, TypeScript path aliases, or runtime
-  behavior of any kind. Static references only; runs say so.
+* Package `exports`/`imports` map resolution, TypeScript path aliases,
+  pnpm-style symlinked `node_modules` layouts, or runtime behavior of any
+  kind. Static references only; runs say so. What *is* resolved, Node-style:
+  relative specifiers probe `name`, `name.js`, `name.json`, then (for
+  directories) `package.json` `main` and `index.js`; bare specifiers probe
+  `node_modules/<name>` walking up from the referring file (scoped packages
+  and subpaths included). A lone `@scope` resolves through
+  `node_modules/@scope/` exactly like real Node. `sourceMappingURL` and HTML
+  `src` references resolve relative to the referring file with URL
+  semantics: query/fragment stripped, path percent-decoded once.
 
 ## Not available yet (planned integrations)
 

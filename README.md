@@ -147,17 +147,21 @@ Real output (paths trimmed):
 
 ```
 Target: fixtures/javascript-demo (directory)
-SHA-256: 5949bd712e1b37c5b17c21e1b7972ab075756eb50f038482d261577f1c476018
-Files: 13 (6 directories, 3.5 KiB total)
+SHA-256: 54ab9de75f4b7988ec614fd3fa613968f2d21267b796355e3c498ca6a7ea5c07
+Files: 15 (9 directories, 6.4 KiB total)
 Entry point: src/main.js (derived from package.json)
 Classification: electron (derived; evidence: package.json declares 'electron')
 Source map references: 2
 
-Findings (7):
+Findings (9):
   [derived] binary_artifact assets/icon.png
       assets/icon.png: png (PNG image)
   [observed] sourcemap_reference dist/bundle.js:2
       dist/bundle.js:2 references source map 'bundle.js.map'
+  [observed] package_manifest node_modules/tiny-dep/package.json
+      node_modules/tiny-dep/package.json: package manifest for tiny-dep 1.0.0
+  [derived] entry_point node_modules/tiny-dep/package.json
+      node_modules/tiny-dep/package.json: entry point 'lib/entry.js'
   [observed] package_manifest package.json
       package.json: package manifest for vortex-js-demo 1.2.3
   ...
@@ -172,15 +176,15 @@ Search for the known marker:
 
 ```
 Query: 'VORTEX_DEMO_MARKER' (case-insensitive)
-Matches: 3 across 11 searched file(s)
+Matches: 3 across 13 searched file(s)
 
 Findings (3):
   [observed] search_match README.md:16
       README.md:16:26: match 'VORTEX_DEMO_MARKER' (18 bytes)
   [observed] search_match dist/bundle.js:1
       dist/bundle.js:1:245: match 'VORTEX_DEMO_MARKER' (18 bytes)
-  [observed] search_match src/main.js:10
-      src/main.js:10:21: match 'VORTEX_DEMO_MARKER' (18 bytes)
+  [observed] search_match src/main.js:11
+      src/main.js:11:21: match 'VORTEX_DEMO_MARKER' (18 bytes)
 
 Limitations (1):
   - 2 binary file(s) were skipped by literal search
@@ -193,22 +197,30 @@ Trace relationships:
 ```
 
 ```
-Relationships: 13 (8 resolved, 5 unresolved)
+Relationships: 15 (10 resolved, 5 unresolved)
 
-Edges (13):
-  vortex-js-demo --declares_dependency--> minimist [unresolved: declared as '^1.2.8' but not installed locally (node_module…]
+Edges (15):
+  vortex-js-demo --declares_dependency--> minimist [unresolved: declared as '^1.2.8' but not found in any inspected node_mo…]
+  vortex-js-demo --declares_dependency--> node_modules/tiny-dep/lib/entry.js [resolved]
+  vortex-js-demo --declares_dependency--> electron [unresolved: declared as '^33.0.0' but not found in any inspected node_m…]
   dist/bundle.js --references_sourcemap--> dist/bundle.js.map [resolved]
+  src/lib/config.js --requires--> src/lib/defaults.json [resolved]
   src/lib/updater.js --requires--> ./missing-module.js [unresolved: no local file matched './missing-module.js' (tried: src/lib…]
   src/main.js --requires--> src/lib/config.js [resolved]
+  src/main.js --requires--> src/lib/updater.js [resolved]
+  src/main.js --requires--> node_modules/tiny-dep/lib/entry.js [resolved]
+  src/main.js --requires--> minimist [resolved]
   src/main.js --requires--> fs [resolved]
+  src/main.js --references_sourcemap--> main.js.map [unresolved: no local file matched './main.js.map' (tried: src/main.js.m…]
   src/renderer/index.html --references_script--> src/renderer/renderer.js [resolved]
   src/renderer/renderer.js --imports--> src/renderer/components/button.js [resolved]
   src/renderer/renderer.js --imports--> ./theme.js [unresolved: no local file matched './theme.js' (tried: src/renderer/the…]
-  ...
 ```
 
 (The two unresolved imports are deliberate fixture properties, and they
-also appear in the run's `unknowns`.)
+also appear in the run's `unknowns`. The vendored `tiny-dep` resolves
+through `node_modules` exactly like Node would, honoring its `package.json`
+`main` — including for bare, scoped, and subpath specifiers.)
 
 Then work with the stored evidence:
 
@@ -341,7 +353,7 @@ The acceptance bar for the MVP, with the evidence that meets it:
 | Output bounded + paginated | limits tests; MCP pagination tests |
 | Malformed input → controlled errors | malformed-manifest tests; CLI error tests |
 | Targets never executed | no execution path exists; static-only rule enforced in review |
-| Tests cover functionality | 159 tests, incl. golden + protocol suites |
+| Tests cover functionality | 176 tests, incl. golden + protocol suites |
 | No known ignored security issue | docs/THREAT_MODEL.md tracks residual risks explicitly |
 
 ## Tested platforms
@@ -361,6 +373,13 @@ parsing, Rizin after license review) → Phase Four (source map
 reconstruction, deeper comparisons) → Phase Five (controlled dynamic
 analysis) → Phase Six (patch-and-verify labs). Details and acceptance
 criteria per phase: [docs/ROADMAP.md](docs/ROADMAP.md).
+
+The roadmap is informed by systematic study of real-world failures in the
+category: [docs/UPSTREAM_LESSONS.md](docs/UPSTREAM_LESSONS.md) analyzes
+2,098 issues from the upstream project that inspired this space, records
+which of those failure modes existed in early Vortex-RE code (and were
+fixed, with tests), and lists the standing engineering rules adopted as a
+result.
 
 ## Contributing
 

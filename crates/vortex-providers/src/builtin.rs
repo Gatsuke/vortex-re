@@ -1127,41 +1127,56 @@ fn relationships_impl(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde
             .iter()
             .chain(manifest.dev_dependencies.iter())
         {
-            let installed = ctx
-                .root
-                .join(
-                    Path::new(&manifest.rel_path)
-                        .parent()
-                        .unwrap_or(Path::new("")),
-                )
-                .join("node_modules")
-                .join(&dep.name)
-                .is_dir();
-            builder.relationship(
-                package_node.clone(),
-                Node {
-                    kind: "external_package".to_string(),
-                    id: dep.name.clone(),
-                },
-                "declares_dependency",
-                Scope::External,
-                if installed {
-                    Resolution::Resolved
-                } else {
-                    Resolution::Unresolved
-                },
-                Some(if installed {
-                    format!("declared '{}' and installed under node_modules", dep.range)
-                } else {
-                    format!(
-                        "declared as '{}' but not installed locally (node_modules absent)",
-                        dep.range
-                    )
-                }),
-                Origin::Observed,
-                None,
-                Some(Location::file(&manifest.rel_path)),
+            // Vendored dependencies resolve to their real entry file inside
+            // the inspected tree (Node-style node_modules lookup, honoring
+            // package.json `main`); anything else is reported as not found
+            // — never as "node_modules absent", which may be false.
+            let vendored_entry = javascript::resolve_bare_in_node_modules(
+                ctx.root,
+                Path::new(&manifest.rel_path),
+                &dep.name,
             );
+            match vendored_entry {
+                Some(entry) => {
+                    builder.relationship(
+                        package_node.clone(),
+                        Node {
+                            kind: "file".to_string(),
+                            id: entry.clone(),
+                        },
+                        "declares_dependency",
+                        Scope::Internal,
+                        Resolution::Resolved,
+                        Some(format!(
+                            "declared '{}' and vendored under node_modules (entry {entry}; \
+                             package 'exports' maps are not evaluated)",
+                            dep.range
+                        )),
+                        Origin::Observed,
+                        None,
+                        Some(Location::file(&manifest.rel_path)),
+                    );
+                }
+                None => {
+                    builder.relationship(
+                        package_node.clone(),
+                        Node {
+                            kind: "external_package".to_string(),
+                            id: dep.name.clone(),
+                        },
+                        "declares_dependency",
+                        Scope::External,
+                        Resolution::Unresolved,
+                        Some(format!(
+                            "declared as '{}' but not found in any inspected node_modules directory",
+                            dep.range
+                        )),
+                        Origin::Observed,
+                        None,
+                        Some(Location::file(&manifest.rel_path)),
+                    );
+                }
+            }
         }
     }
 
@@ -1417,6 +1432,30 @@ fn record_import_relationship(
                     evidence_id.map(str::to_string),
                     location,
                 );
+            } else if let Some(local) = javascript::resolve_bare_in_node_modules(
+                root,
+                Path::new(rel_path),
+                &import.specifier,
+            ) {
+                // Node-style node_modules lookup resolved inside the artifact.
+                builder.relationship(
+                    from,
+                    Node {
+                        kind: "file".to_string(),
+                        id: local.clone(),
+                    },
+                    kind,
+                    Scope::Internal,
+                    Resolution::Resolved,
+                    Some(
+                        "resolved through a local node_modules directory (static path \
+                         lookup; package 'exports'/'imports' maps are not evaluated)"
+                            .to_string(),
+                    ),
+                    Origin::Observed,
+                    evidence_id.map(str::to_string),
+                    location,
+                );
             } else {
                 let name = package_name_of(&import.specifier);
                 let is_declared = declared.contains(name.as_str());
@@ -1434,9 +1473,9 @@ fn record_import_relationship(
                         Resolution::Unresolved
                     },
                     Some(if is_declared {
-                        "declared in an inspected package.json (not installed locally)".to_string()
+                        "declared in an inspected package.json and not found in any inspected node_modules directory".to_string()
                     } else {
-                        "not declared in any inspected package.json".to_string()
+                        "not declared in any inspected package.json and not found in any inspected node_modules directory".to_string()
                     }),
                     Origin::Observed,
                     evidence_id.map(str::to_string),
@@ -1722,6 +1761,83 @@ mod tests {
         assert!(unresolved.len() >= 3);
         assert!(unresolved.iter().all(|r| r.resolution_note.is_some()));
         assert!(report.unknowns.iter().any(|u| u.contains("./missing.js")));
+    }
+
+    /// REA #4632/#2259 lesson: bare specifiers that resolve through a local
+    /// `node_modules` must be reported as internal edges, and external notes
+    /// must never claim absence without having looked.
+    #[test]
+    fn relationships_resolve_bare_specifiers_through_node_modules() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().join("app");
+        std::fs::create_dir_all(base.join("node_modules/@scope/pkg/lib")).unwrap();
+        std::fs::create_dir_all(base.join("node_modules/ordinary")).unwrap();
+        std::fs::write(
+            base.join("package.json"),
+            br#"{"name":"demo","main":"main.cjs"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("main.cjs"),
+            b"require('@scope');\nrequire('@scope/pkg/lib/helper');\nrequire('ordinary');\nrequire('leftpad');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("node_modules/@scope/index.js"),
+            b"module.exports = 1;",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("node_modules/@scope/pkg/lib/helper.js"),
+            b"module.exports = 1;",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("node_modules/ordinary/package.json"),
+            br#"{"main":"entry.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("node_modules/ordinary/entry.js"),
+            b"module.exports = 1;",
+        )
+        .unwrap();
+
+        let request = request_for(&base, ResourceLimits::default());
+        let provider = BuiltinStaticProvider::new();
+        let report = provider.relationships(&request);
+
+        let edge = |from: &str, to: &str, kind: &str| {
+            report
+                .relationships
+                .iter()
+                .any(|r| r.from.id == from && r.to.id == to && r.kind == kind)
+        };
+        let internal_edge = |to: &str| {
+            report.relationships.iter().any(|r| {
+                r.to.id == to && r.scope == Scope::Internal && r.status == Resolution::Resolved
+            })
+        };
+
+        // REA #4632: scope directory package.
+        assert!(internal_edge("node_modules/@scope/index.js"));
+        // Subpath import into a scoped package.
+        assert!(internal_edge("node_modules/@scope/pkg/lib/helper.js"));
+        // package.json main inside node_modules.
+        assert!(internal_edge("node_modules/ordinary/entry.js"));
+        // A package that exists nowhere stays external and truthful.
+        assert!(edge("main.cjs", "leftpad", "requires"));
+        let leftpad = report
+            .relationships
+            .iter()
+            .find(|r| r.to.id == "leftpad")
+            .expect("leftpad edge");
+        assert_eq!(leftpad.scope, Scope::External);
+        assert!(leftpad
+            .resolution_note
+            .as_deref()
+            .unwrap()
+            .contains("not found in any inspected node_modules directory"));
     }
 
     #[test]

@@ -2,20 +2,6 @@
   "description": "Expected relationship edges for fixtures/javascript-demo, verified against the real implementation (see apps/vortex/tests/golden.rs).",
   "edges": [
     {
-      "from": "vortex-js-demo",
-      "to": "minimist",
-      "kind": "declares_dependency",
-      "scope": "external",
-      "status": "unresolved"
-    },
-    {
-      "from": "vortex-js-demo",
-      "to": "electron",
-      "kind": "declares_dependency",
-      "scope": "external",
-      "status": "unresolved"
-    },
-    {
       "from": "dist/bundle.js",
       "to": "dist/bundle.js.map",
       "kind": "references_sourcemap",
@@ -38,27 +24,6 @@
     },
     {
       "from": "src/main.js",
-      "to": "src/lib/config.js",
-      "kind": "requires",
-      "scope": "internal",
-      "status": "resolved"
-    },
-    {
-      "from": "src/main.js",
-      "to": "src/lib/updater.js",
-      "kind": "requires",
-      "scope": "internal",
-      "status": "resolved"
-    },
-    {
-      "from": "src/main.js",
-      "to": "minimist",
-      "kind": "requires",
-      "scope": "external",
-      "status": "resolved"
-    },
-    {
-      "from": "src/main.js",
       "to": "fs",
       "kind": "requires",
       "scope": "external",
@@ -72,16 +37,37 @@
       "status": "unresolved"
     },
     {
-      "from": "src/renderer/index.html",
-      "to": "src/renderer/renderer.js",
-      "kind": "references_script",
+      "from": "src/main.js",
+      "to": "minimist",
+      "kind": "requires",
+      "scope": "external",
+      "status": "resolved"
+    },
+    {
+      "from": "src/main.js",
+      "to": "node_modules/tiny-dep/lib/entry.js",
+      "kind": "requires",
       "scope": "internal",
       "status": "resolved"
     },
     {
-      "from": "src/renderer/renderer.js",
-      "to": "src/renderer/components/button.js",
-      "kind": "imports",
+      "from": "src/main.js",
+      "to": "src/lib/config.js",
+      "kind": "requires",
+      "scope": "internal",
+      "status": "resolved"
+    },
+    {
+      "from": "src/main.js",
+      "to": "src/lib/updater.js",
+      "kind": "requires",
+      "scope": "internal",
+      "status": "resolved"
+    },
+    {
+      "from": "src/renderer/index.html",
+      "to": "src/renderer/renderer.js",
+      "kind": "references_script",
       "scope": "internal",
       "status": "resolved"
     },
@@ -91,6 +77,34 @@
       "kind": "imports",
       "scope": "internal",
       "status": "unresolved"
+    },
+    {
+      "from": "src/renderer/renderer.js",
+      "to": "src/renderer/components/button.js",
+      "kind": "imports",
+      "scope": "internal",
+      "status": "resolved"
+    },
+    {
+      "from": "vortex-js-demo",
+      "to": "electron",
+      "kind": "declares_dependency",
+      "scope": "external",
+      "status": "unresolved"
+    },
+    {
+      "from": "vortex-js-demo",
+      "to": "minimist",
+      "kind": "declares_dependency",
+      "scope": "external",
+      "status": "unresolved"
+    },
+    {
+      "from": "vortex-js-demo",
+      "to": "node_modules/tiny-dep/lib/entry.js",
+      "kind": "declares_dependency",
+      "scope": "internal",
+      "status": "resolved"
     }
   ]
 }

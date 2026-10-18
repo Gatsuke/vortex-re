@@ -143,13 +143,21 @@ fn inspection_matches_expected_summary() {
         expected["entry_point"]
     );
 
-    // Manifest facts surfaced through findings.
+    // Manifest facts surfaced through findings: the fixture's *root*
+    // manifest (package.json). The vendored node_modules/tiny-dep has its
+    // own package_manifest finding; the root one is the documented package.
     let manifest = result
         .report
         .findings
         .iter()
-        .find(|f| f.kind == "package_manifest")
-        .expect("package manifest finding");
+        .find(|f| {
+            f.kind == "package_manifest"
+                && f.location
+                    .as_ref()
+                    .and_then(|l| l.file.as_deref())
+                    .is_some_and(|file| file == "package.json")
+        })
+        .expect("root package manifest finding");
     assert_eq!(manifest.details["name"], expected["package"]["name"]);
     assert_eq!(manifest.details["version"], expected["package"]["version"]);
     assert_eq!(manifest.details["main"], expected["package"]["main"]);

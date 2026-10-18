@@ -166,10 +166,12 @@ async fn inspect_tool_returns_bounded_paginated_results() {
     assert_eq!(result.is_error, Some(false));
     let payload = structured(&result);
     assert_eq!(payload["status"], "succeeded");
-    assert_eq!(payload["summary"]["file_count"], 13);
-    assert_eq!(payload["counts"]["findings"], 7);
+    // 15 files: fixture ships a vendored node_modules/tiny-dep (+2 files).
+    assert_eq!(payload["summary"]["file_count"], 15);
+    // 9 findings: tiny-dep adds a second package_manifest and entry_point.
+    assert_eq!(payload["counts"]["findings"], 9);
     assert_eq!(payload["pagination"]["page_size"], 3);
-    assert_eq!(payload["pagination"]["total_items"], 7);
+    assert_eq!(payload["pagination"]["total_items"], 9);
     assert_eq!(payload["pagination"]["has_next"], true);
     assert_eq!(
         payload["findings"].as_array().unwrap().len(),
@@ -274,7 +276,7 @@ async fn search_tool_finds_known_fixture_matches() {
             )
         })
         .collect();
-    assert!(locations.contains(&"src/main.js:10".to_string()));
+    assert!(locations.contains(&"src/main.js:11".to_string()));
     shutdown(client, server_handle).await;
 }
 
@@ -290,10 +292,13 @@ async fn trace_tool_returns_expected_edges() {
     .await;
     assert_eq!(result.is_error, Some(false));
     let payload = structured(&result);
-    assert_eq!(payload["summary"]["relationships"], 13);
-    assert_eq!(payload["summary"]["resolved"], 8);
+    // 15 edges: the vendored tiny-dep adds a resolved `requires` edge from
+    // src/main.js and a resolved `declares_dependency` edge from the root
+    // package, both pointing at node_modules/tiny-dep/lib/entry.js.
+    assert_eq!(payload["summary"]["relationships"], 15);
+    assert_eq!(payload["summary"]["resolved"], 10);
     assert_eq!(payload["summary"]["unresolved"], 5);
-    assert_eq!(payload["relationships"].as_array().unwrap().len(), 13);
+    assert_eq!(payload["relationships"].as_array().unwrap().len(), 15);
     shutdown(client, server_handle).await;
 }
 
@@ -340,7 +345,7 @@ async fn evidence_round_trip_through_mcp() {
     let payload = structured(&read);
     assert_eq!(payload["section"], "findings");
     assert_eq!(payload["page"]["page"], 2);
-    assert_eq!(payload["page"]["total_items"], 7);
+    assert_eq!(payload["page"]["total_items"], 9);
     assert_eq!(payload["items"].as_array().unwrap().len(), 2);
 
     // Bad section name is a validation error the agent can read.

@@ -39,9 +39,24 @@ archive extraction.
       `vortex runs recover` is manual).
 - [ ] Resumable runs for large artifacts (checkpoint the walk position).
 - [ ] MCP protocol-level cancellation mapped to run cancellation
-      (application-level cancellation exists today).
+      (application-level cancellation exists today). Cancellation rules from
+      upstream research (docs/UPSTREAM_LESSONS.md, Lesson 3): check before
+      every store commit; a cancelled run never emits `succeeded`; completed
+      partial findings are retained and labeled `cancelled`.
+- [ ] CLI/MCP error-code parity tests: identical invalid input must produce
+      the identical structured error through both surfaces.
+- [ ] Doctor hardening: malformed-input unit tests (truncated config,
+      garbage data), platform-filtered recovery hints.
+- [ ] Response-size budget test: a pathological fixture's MCP response stays
+      under a fixed byte ceiling (bounded-output regression guard).
+- [ ] Adversarial artifact corpus in CI (giant single line, deep tree,
+      pathological package graph) — all must produce `partial`, never a
+      crash (docs/UPSTREAM_LESSONS.md, Lesson 1).
 - [ ] Provider timeouts as first-class, per-provider configuration.
 - [ ] Signed/append-only evidence export option (tamper evidence).
+- [ ] Evidence-record identity stability policy: schema changes never
+      silently alter run IDs or digests; older records import with an
+      explicit `older_schema` note (upstream #4436 lesson).
 - [ ] SQLite-backed `RunStore` behind the existing trait if query needs
       outgrow file scanning (not planned for its own sake).
 - [ ] Config file for persistent limit overrides (environment + flags today).

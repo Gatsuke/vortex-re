@@ -1,12 +1,23 @@
 {
-  "description": "Expected search results for query 'VORTEX_DEMO_MARKER' (case-insensitive) in fixtures/javascript-demo, verified against the real implementation (see apps/vortex/tests/golden.rs).",
+  "description": "Expected search matches for the marker 'VORTEX_DEMO_MARKER' in fixtures/javascript-demo, verified against the real implementation (see apps/vortex/tests/golden.rs).",
   "query": "VORTEX_DEMO_MARKER",
-  "case_sensitive": false,
   "match_count": 3,
   "files_skipped_binary": 2,
   "matches": [
-    { "file": "README.md", "line": 16, "column": 26 },
-    { "file": "dist/bundle.js", "line": 1, "column": 245 },
-    { "file": "src/main.js", "line": 10, "column": 21 }
+    {
+      "file": "README.md",
+      "line": 16,
+      "column": 26
+    },
+    {
+      "file": "dist/bundle.js",
+      "line": 1,
+      "column": 245
+    },
+    {
+      "file": "src/main.js",
+      "line": 11,
+      "column": 21
+    }
   ]
 }

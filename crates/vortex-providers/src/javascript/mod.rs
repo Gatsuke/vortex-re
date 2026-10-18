@@ -12,8 +12,8 @@ pub mod scanner;
 
 pub use manifest::{parse_manifest, DependencyDecl, PackageManifest};
 pub use resolve::{
-    classify_specifier, is_node_builtin, resolve_relative_reference, resolve_specifier, Resolution,
-    SpecifierKind,
+    classify_specifier, is_node_builtin, resolve_bare_in_node_modules, resolve_relative_reference,
+    resolve_specifier, Resolution, SpecifierKind,
 };
 pub use scanner::{
     detect_module_systems, scan_imports, scan_script_sources, scan_source_map_refs, ImportRef,
