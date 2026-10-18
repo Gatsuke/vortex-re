@@ -1,0 +1,17 @@
+[package]
+name = "vortex-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Application service layer shared by the Vortex-RE CLI and MCP server"
+
+[dependencies]
+vortex-core = { workspace = true }
+vortex-evidence = { workspace = true }
+vortex-providers = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
