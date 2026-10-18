@@ -1,0 +1,15 @@
+# License
+
+Vortex-RE is dual-licensed under the MIT and Apache-2.0 licenses, the
+standard licensing scheme for the Rust ecosystem.
+
+* [LICENSE-MIT](LICENSE-MIT)
+* [LICENSE-APACHE](LICENSE-APACHE)
+
+You may use Vortex-RE under either license, at your option. Sections of the
+codebase may be relicensed under more permissive terms in the future; the
+dual license will always remain an available option.
+
+The license of Vortex-RE itself is separate from the licenses of its
+dependencies and optional providers; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+for the dependency inventory and attribution details.

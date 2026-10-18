@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target
+**/target
+
+# Do not ignore the lockfile: it is committed for reproducible builds.
+# (Cargo.lock stays in the repository.)
+
+# Local run data / evidence stores produced during manual testing
+.vortex-re/
+*.vortex-home/
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Coverage / benchmark output
+/coverage
+*.profraw
