@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: CI only needs to read the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep CI deterministic: the lockfile is committed and must be used.
+  CARGO_NET_RETRY: 5
+  RUSTUP_MAX_RETRIES: 5
+
+jobs:
+  lint:
+    name: fmt + clippy (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # actions/checkout v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust (stable, clippy + rustfmt)
+        # dtolnay/rust-toolchain @ stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          components: clippy, rustfmt
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Compile check (all targets)
+        run: cargo check --workspace --all-targets --locked
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-linux:
+    name: test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  test-macos:
+    name: test (macos-latest, advisory)
+    # macOS has not been verified locally by the maintainers yet; results are
+    # advisory until someone with macOS hardware confirms them.
+    continue-on-error: true
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  test-windows:
+    name: test (windows-latest, advisory)
+    # Windows has not been verified locally by the maintainers yet; results
+    # are advisory until confirmed on Windows hardware.
+    continue-on-error: true
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  release-build:
+    name: release build (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Smoke test the release binary
+        run: |
+          ./target/release/vortex --version
+          ./target/release/vortex doctor
+          ./target/release/vortex inspect fixtures/javascript-demo --no-store
