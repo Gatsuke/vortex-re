@@ -1,0 +1,28 @@
+{
+  "description": "Expected inspection facts for fixtures/javascript-demo, verified against the real implementation (see apps/vortex/tests/golden.rs).",
+  "file_count": 13,
+  "directory_count": 6,
+  "package": {
+    "name": "vortex-js-demo",
+    "version": "1.2.3",
+    "main": "src/main.js",
+    "type": "commonjs"
+  },
+  "entry_point": "src/main.js",
+  "electron": true,
+  "sourcemap_references": [
+    { "file": "dist/bundle.js", "line": 2, "url": "bundle.js.map" },
+    { "file": "src/main.js", "line": 29, "url": "main.js.map" }
+  ],
+  "binary_artifacts": [
+    { "file": "assets/icon.png", "format": "png", "basis": "magic_bytes" }
+  ],
+  "finding_kinds": {
+    "binary_artifact": 1,
+    "classification": 1,
+    "classification_summary": 1,
+    "entry_point": 1,
+    "package_manifest": 1,
+    "sourcemap_reference": 2
+  }
+}

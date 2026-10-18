@@ -1,0 +1,17 @@
+{
+  "name": "vortex-js-demo",
+  "version": "1.2.3",
+  "description": "Redistributable JavaScript/Electron demonstration fixture for Vortex-RE tests. Safe to inspect; never needs to be executed.",
+  "main": "src/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node src/main.js"
+  },
+  "dependencies": {
+    "minimist": "^1.2.8"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}
