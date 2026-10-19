@@ -344,7 +344,8 @@ def build_pe(is_pe32_plus, imports, dotnet=False):
             0x06000001,         # EntryPointToken (void Main())
         ) + b"\x00" * (72 - 24)  # remaining fixed fields
         # Metadata root: BSJB
-        md = struct.pack("<IHHII", 0x424A5342, 1, 1, 0, len(version))
+        # ECMA-335: the length field is the allocated size (padded to 4).
+        md = struct.pack("<IHHII", 0x424A5342, 1, 1, 0, version_len)
         md += version + b"\x00" * (version_len - len(version))
         md += struct.pack("<HH", 0, len(stream_names))
         cur = md_header_size

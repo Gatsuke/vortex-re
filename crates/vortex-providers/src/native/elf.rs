@@ -257,11 +257,7 @@ pub fn parse(bytes: &[u8]) -> Result<ElfFile, String> {
         let first = raw_sections.as_ref().and_then(|v| v.first()).copied();
         let real = first.map(|f| f.size as usize).unwrap_or(0);
         file.section_total = real;
-        raw_sections = if real == 0 {
-            None
-        } else {
-            read_sections(real)
-        };
+        raw_sections = if real == 0 { None } else { read_sections(real) };
     }
 
     let Some(raw_sections) = raw_sections else {
@@ -287,16 +283,22 @@ pub fn parse(bytes: &[u8]) -> Result<ElfFile, String> {
     } else {
         Some(shstrndx as usize)
     };
-    let name_reader = shstrndx_resolved.and_then(|idx| raw_sections.get(idx)).map(|sh| {
-        (
-            Reader::with_endian(
-                reader.slice(sh.offset as usize, sh.size.min(MAX_NAME_BYTES as u64 * 64) as usize)
-                    .unwrap_or(&[]),
-                data == ELFDATA2MSB,
-            ),
-            sh.size,
-        )
-    });
+    let name_reader = shstrndx_resolved
+        .and_then(|idx| raw_sections.get(idx))
+        .map(|sh| {
+            (
+                Reader::with_endian(
+                    reader
+                        .slice(
+                            sh.offset as usize,
+                            sh.size.min(MAX_NAME_BYTES as u64 * 64) as usize,
+                        )
+                        .unwrap_or(&[]),
+                    data == ELFDATA2MSB,
+                ),
+                sh.size,
+            )
+        });
 
     for raw in &raw_sections {
         let name = name_reader
@@ -337,7 +339,11 @@ pub fn parse(bytes: &[u8]) -> Result<ElfFile, String> {
         };
         let str_reader = Reader::with_endian(str_bytes, data == ELFDATA2MSB);
         let entsize = if sym.entsize == 0 {
-            if is64 { 24u64 } else { 16u64 }
+            if is64 {
+                24u64
+            } else {
+                16u64
+            }
         } else {
             sym.entsize
         };
@@ -375,8 +381,7 @@ pub fn parse(bytes: &[u8]) -> Result<ElfFile, String> {
         }
     }
     if file.imports.is_empty() && file.imports_reason.is_none() {
-        file.imports_reason =
-            Some("no undefined dynamic symbols with names found".to_string());
+        file.imports_reason = Some("no undefined dynamic symbols with names found".to_string());
     }
     Ok(file)
 }
@@ -405,10 +410,7 @@ mod tests {
         assert_eq!(file.entry, 0x1000);
         assert_eq!(file.section_total, 5);
         let names: Vec<&str> = file.sections.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["", ".text", ".dynsym", ".dynstr", ".shstrtab"]
-        );
+        assert_eq!(names, vec!["", ".text", ".dynsym", ".dynstr", ".shstrtab"]);
         assert!(file.sections_reason.is_none());
         assert_eq!(file.imports, vec!["puts", "malloc"]);
     }
@@ -445,11 +447,7 @@ mod tests {
         // Cut just before the section table (shoff = 192 for this fixture).
         let cut = parse(&full[..188]).expect("header still parses");
         assert!(cut.sections.is_empty());
-        assert!(cut
-            .sections_reason
-            .as_deref()
-            .unwrap()
-            .contains("beyond"));
+        assert!(cut.sections_reason.as_deref().unwrap().contains("beyond"));
         assert!(cut.imports.is_empty());
         assert!(cut.imports_reason.is_some());
     }
@@ -466,7 +464,7 @@ mod tests {
         // e_type = 2 (EXEC) big-endian at 16.
         bytes[16..18].copy_from_slice(&0x0002u16.to_be_bytes());
         bytes[18..20].copy_from_slice(&0x0003u16.to_be_bytes()); // e_machine i386
-        // e_shentsize 40 at 46, everything else zero (no table, no phdrs).
+                                                                 // e_shentsize 40 at 46, everything else zero (no table, no phdrs).
         bytes[46..48].copy_from_slice(&40u16.to_be_bytes());
         let file = parse(&bytes).expect("parses");
         assert!(file.big_endian);
