@@ -42,6 +42,8 @@ const LIMIT_KEYS: &[&str] = &[
     "max_strings_per_file",
     "max_archive_members",
     "max_archive_member_bytes",
+    "max_sourcemap_bytes",
+    "max_sourcemap_segments",
     "max_line_context_bytes",
     "timeout_secs",
     "page_size_default",
@@ -160,6 +162,10 @@ pub struct PartialLimits {
     pub max_archive_members: Option<usize>,
     /// See [`ResourceLimits::max_archive_member_bytes`].
     pub max_archive_member_bytes: Option<u64>,
+    /// See [`ResourceLimits::max_sourcemap_bytes`].
+    pub max_sourcemap_bytes: Option<u64>,
+    /// See [`ResourceLimits::max_sourcemap_segments`].
+    pub max_sourcemap_segments: Option<usize>,
     /// See [`ResourceLimits::max_line_context_bytes`].
     pub max_line_context_bytes: Option<usize>,
     /// See [`ResourceLimits::timeout_secs`].
@@ -251,6 +257,12 @@ impl FileConfig {
             }
             if let Some(v) = file.max_archive_member_bytes {
                 limits.max_archive_member_bytes = v;
+            }
+            if let Some(v) = file.max_sourcemap_bytes {
+                limits.max_sourcemap_bytes = v;
+            }
+            if let Some(v) = file.max_sourcemap_segments {
+                limits.max_sourcemap_segments = v;
             }
             if let Some(v) = file.max_line_context_bytes {
                 limits.max_line_context_bytes = v;
@@ -396,6 +408,8 @@ max_string_length = 200
 max_strings_per_file = 18
 max_archive_members = 24
 max_archive_member_bytes = 4096
+max_sourcemap_bytes = 8192
+max_sourcemap_segments = 25
 max_line_context_bytes = 19
 timeout_secs = 20
 page_size_default = 21
@@ -411,6 +425,8 @@ grace_secs = 23
         assert_eq!(limits.max_matches_per_file, 16);
         assert_eq!(limits.max_archive_members, 24);
         assert_eq!(limits.max_archive_member_bytes, 4096);
+        assert_eq!(limits.max_sourcemap_bytes, 8192);
+        assert_eq!(limits.max_sourcemap_segments, 25);
         assert_eq!(limits.page_size_max, 22);
         assert_eq!(config.recovery_grace_secs(), 23);
     }

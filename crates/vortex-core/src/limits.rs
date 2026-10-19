@@ -37,6 +37,12 @@ pub struct ResourceLimits {
     pub max_archive_members: usize,
     /// Maximum decompressed bytes read from a single archive member.
     pub max_archive_member_bytes: u64,
+    /// Maximum bytes read and parsed for a single source map file.
+    /// Larger map files are refused with a limitation, not half-parsed.
+    pub max_sourcemap_bytes: u64,
+    /// Maximum mapping segments decoded per source map. Decoding stops at
+    /// the cap and the stop is disclosed; the true count stays unknown.
+    pub max_sourcemap_segments: usize,
     /// Maximum line length echoed back in search results.
     pub max_line_context_bytes: usize,
     /// Time budget for one operation, in seconds.
@@ -64,6 +70,8 @@ impl Default for ResourceLimits {
             max_strings_per_file: 50,
             max_archive_members: 500,
             max_archive_member_bytes: 4 * 1024 * 1024,
+            max_sourcemap_bytes: 16 * 1024 * 1024,
+            max_sourcemap_segments: 100_000,
             max_line_context_bytes: 400,
             timeout_secs: 30,
             page_size_default: 20,
@@ -107,6 +115,12 @@ impl ResourceLimits {
         }
         if self.max_archive_member_bytes == 0 {
             problems.push("max_archive_member_bytes must be >= 1");
+        }
+        if self.max_sourcemap_bytes == 0 {
+            problems.push("max_sourcemap_bytes must be >= 1");
+        }
+        if self.max_sourcemap_segments == 0 {
+            problems.push("max_sourcemap_segments must be >= 1");
         }
         if self.page_size_default == 0 || self.page_size_max == 0 {
             problems.push("page sizes must be >= 1");
@@ -163,5 +177,22 @@ mod tests {
         assert_eq!(limits.clamp_page_size(Some(0)), 1);
         assert_eq!(limits.clamp_page_size(Some(10_000)), limits.page_size_max);
         assert_eq!(limits.clamp_page_size(Some(50)), 50);
+    }
+
+    #[test]
+    fn sourcemap_limits_must_be_positive() {
+        let limits = ResourceLimits {
+            max_sourcemap_bytes: 0,
+            ..ResourceLimits::default()
+        };
+        let err = limits.validate().unwrap_err();
+        assert!(err.contains("max_sourcemap_bytes"));
+
+        let limits = ResourceLimits {
+            max_sourcemap_segments: 0,
+            ..ResourceLimits::default()
+        };
+        let err = limits.validate().unwrap_err();
+        assert!(err.contains("max_sourcemap_segments"));
     }
 }

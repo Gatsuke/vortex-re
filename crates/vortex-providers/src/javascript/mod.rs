@@ -9,6 +9,7 @@
 pub mod manifest;
 pub mod resolve;
 pub mod scanner;
+pub mod sourcemap;
 
 pub use manifest::{parse_manifest, DependencyDecl, PackageManifest};
 pub use resolve::{
@@ -18,4 +19,8 @@ pub use resolve::{
 pub use scanner::{
     detect_module_systems, scan_imports, scan_script_sources, scan_source_map_refs, ImportRef,
     ImportSyntax, ModuleSystem, ScriptRef, SourceMapRef,
+};
+pub use sourcemap::{
+    parse_source_map, LookupResult, SegmentMapping, SourceMapDoc, SourceMapParseError,
+    SourceMapStats,
 };
