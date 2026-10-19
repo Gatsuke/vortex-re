@@ -79,22 +79,53 @@ override).
 recovers cleanly on next start with an explanation; cancellation returns
 within one checkpoint; partial results never regress.
 
-## Phase Three — broader static analysis
+## Phase Three — broader static analysis (shipped)
 
 **Goal**: more artifact types with the same honesty rules.
 
-- [ ] Zip extraction with a hard safety review (bomb limits, member path
-      traversal, symlink members) — gates APK/asar work.
-- [ ] Electron `asar` archive listing (extraction-adjacent, read-only).
-- [ ] PE/COFF and ELF structural parsing (sections, imports) without a
-      native engine, where licenses allow.
-- [ ] Rizin-based native analysis provider — after the license and
-      distribution review described in `docs/PROVIDERS.md`.
-- [ ] Android DEX reading (post zip extraction).
-- [ ] `.NET` PE/CLI metadata inventory.
+- [x] Zip-family containers (zip/jar/apk) — shipped as **bounded, in-memory
+      member access** after the safety review concluded that extracting to
+      disk is an attack surface better removed than defended: member listing
+      from the central directory only, per-member reads capped
+      (`max_archive_member_bytes`) and budget-accounted, hazardous names and
+      attributes (traversal, drive-qualified, symlink members, bomb
+      suspects, unsupported methods, encryption) reported as findings,
+      stored+deflate only (pure-Rust backend; other methods honestly
+      unsupported per member), no recursive archive descent.
+- [x] Electron `asar` archive listing (read-only): header parsed per the
+      format the official `asar` tool writes (verified against that tool at
+      implementation time), packed member reads bounded and in-memory,
+      unpacked members listed but not read.
+- [x] PE/COFF structural parsing (PE32 and PE32+): DOS/COFF/optional
+      headers, sections, import table (DLLs + named functions; ordinals
+      counted not fabricated), export names, RVA mapping through the
+      section table — all bounds-checked against the bytes read.
+- [x] ELF structural parsing (32/64-bit, both endians): header, section
+      table with extended-numbering escapes, undefined dynamic symbols from
+      `.dynsym`.
+- [ ] Rizin-based native analysis provider — **deliberately open**: the
+      license and distribution review is documented in
+      `docs/PROVIDERS.md` (LGPL-3 + linking/distribution constraints +
+      process-supervision surface); integration deferred until that
+      decision is made deliberately, not by momentum.
+- [x] Android DEX reading (post zip): header, all table counts, adler32
+      checksum verified as a derived observation (only when the whole file
+      was read), defined-class list through the documented table chain —
+      including `classes*.dex` members inside APKs, with findings located
+      at `archive!member` addresses.
+- [x] `.NET` PE/CLI metadata inventory: CLR header (runtime version,
+      entry-point token, flags) and the BSJB metadata root (version string,
+      stream names/sizes). Inventory only — no type system, no CIL.
 
-**Acceptance**: each type ships with fixtures and golden tests; unsupported
-depth still reports `unsupported_operation` honestly.
+**Acceptance** (met): every shipped type has fixtures and golden tests
+(`apps/vortex/tests/native.rs`, plus committed fixtures under
+`fixtures/native/` and `fixtures/archives/`); unsupported depth still
+reports `unsupported_operation` honestly (Mach-O and WASM today).
+
+Known limitations (documented, tracked below): text search does not enter
+archive members; directory inspection lists native binaries but deep
+structural parsing is single-file inspection; the SQLite `RunStore`
+remains deliberately open from Phase Two.
 
 ## Phase Four — deeper investigation
 

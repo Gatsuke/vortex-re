@@ -110,7 +110,7 @@ of the complete tree.
 **No confidence percentages.** There is no defensible measurement method
 behind such numbers, so the format does not carry them.
 
-### Finding kinds emitted by the built-in provider (v1)
+### Finding kinds emitted by the built-in provider
 
 | Kind | Origin | Meaning |
 | --- | --- | --- |
@@ -128,6 +128,27 @@ behind such numbers, so the format does not carry them.
 | `binary_artifact` | derived | Magic-byte identification of a binary file in a tree |
 | `strings_sample` | observed | Bounded printable strings from a binary (values redacted) |
 | `search_match` | observed | Literal search hit with redacted context line |
+| `elf_header` | observed | ELF identity: class, endianness, type, machine, OS/ABI, entry point |
+| `elf_sections` | observed | Section table census (name, type, size, offset; bounded) |
+| `elf_imports` | observed | Undefined dynamic symbols from `.dynsym` (bounded) |
+| `pe_header` | observed | PE/COFF identity: machine, subsystem, characteristics, timestamp, entry RVA, managed flag |
+| `pe_sections` | observed | Section table census with flags |
+| `pe_imports` | observed | Import table: DLLs with named functions; ordinals counted |
+| `pe_exports` | observed | Exported names (bounded) |
+| `dotnet_metadata` | observed | .NET CLI inventory: runtime version, version string, entry-point token, metadata streams |
+| `dex_header` | observed | DEX identity: version, file size, all table counts |
+| `dex_checksum` | derived | adler32 recomputed vs stored — match, mismatch, or not-verifiable note |
+| `dex_classes` | observed | Defined class descriptors (bounded) |
+| `archive` | observed | Container census: format, member count, methods, APK shape |
+| `archive_members` | observed | Member listing (bounded; zip from the central directory, asar from the JSON header) |
+| `archive_safety` | derived | Hazard observations: bomb suspects, traversal/absolute names, symlink members, unsupported methods, encryption |
+
+**Archive member locations.** Findings derived from a member inside an
+archive use the `archive!member` notation in `location.file` — for example
+`demo-app.apk!classes.dex`. The artifact reference stays the archive
+itself (the member's bytes are not separately digested in this release).
+Tables that fall outside the bytes actually read are reported as
+limitations with reasons, never as absent.
 
 ## Relationships
 

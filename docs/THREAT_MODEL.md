@@ -150,19 +150,45 @@ sections are rejected by name (all at once), so a typo cannot silently
 disable a limit. The effective limits of every run are recorded inside the
 run itself, and `doctor` reports which config file was applied.
 
+### 8. Archive handling safety review (Phase Three, shipped)
+
+Phase Three added member access for zip-family containers and Electron
+asar archives. The hazards considered, and the decisions:
+
+| Hazard | Decision |
+| --- | --- |
+| Zip bombs (high compression ratio) | Reads are capped by `max_archive_member_bytes` per member and by the run byte budget in total; a member declaring more than the cap is read only up to the cap and the truncation is a recorded limitation. Ratios ≥ 100× on members ≥ 1 MiB are flagged as derived `compression_bomb_suspect` findings with the observed numbers. |
+| Member path traversal (`../../x`) | Nothing is ever written to disk, so traversal cannot escape — the write step does not exist. Names with `..` components are still flagged as findings, because "would be dangerous to extract" is evidence worth having. |
+| Absolute / drive-qualified member names | Same reasoning: flagged, never used as a path. |
+| Symlink members | Never created and never followed; unix mode bits are inspected and symlink members are flagged. |
+| Unsupported compression methods | Whitelist: stored and deflate (pure-Rust `zlib-rs` backend, no C). Everything else is listed with metadata only and reported as unsupported per member — never silently skipped and never "supported" via a C library we have not reviewed. |
+| Encrypted members | Flagged; content is honestly unreadable without a password. |
+| Nested archives (zip in zip) | No recursive descent: a nested archive is a listed member, not an implicit deep inspection. The user can inspect it explicitly. |
+| Lying headers (huge declared sizes/counts) | Every table access is bounds-checked against the bytes actually read; declared sizes above the file length or the read cap are rejected or truncated-with-note, never trusted for allocation. |
+| Resource use during listing | Listing reads only the central directory (metadata), capped by `max_archive_members`; per-member work is bounded by fixed constants in the parsers. |
+
+The single decision that simplifies all of it: **no disk extraction, ever**.
+Everything a member can contribute to evidence is decompressed into memory
+under caps and accounted against the run budget. There is no extraction
+directory to escape, no symlink to plant, no permission bit to honor, no
+filename encoding to normalize. This is stronger than sanitizing an
+extraction step, and it is the reasoning the roadmap's "hard safety review"
+gate asked for.
+
 ## Explicit non-goals
 
 * **This is not a sandbox.** "Static analysis only" means the analyzed
   target is never executed — it is not a claim that analyzing hostile
   artifacts is risk-free in every environment.
 * No network access exists to attack; none is added.
-* Archive extraction (zip/asar) is **not implemented** precisely because
-  safe handling (zip bombs, path traversal inside archives, symlink
-  members) needs its own design; it is roadmap work with this document as
-  the gate.
+* Archive **extraction to disk is not implemented and will not be**: the
+  archive safety review (§8) concluded that in-memory, bounded member
+  access removes the extraction attack surface entirely rather than
+  defending it. The gate this document set for archive work was met by
+  *not* building extraction.
 * Dynamic instrumentation, process injection, and binary patching are out
-  of scope for Phase One and would require a dedicated security review
-  before any release.
+  of scope for the static phases and would require a dedicated security
+  review before any release.
 
 ## Future capability gate
 

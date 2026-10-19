@@ -41,13 +41,28 @@ original source code, or guarantee behavioral reconstruction. It claims
 exactly what its implementation and tests support — see
 [Verifying this release](#verifying-this-release).
 
-## Current capabilities (Phases One + Two)
+## Current capabilities (Phases One + Two + Three)
 
 * **Inspect** files and directories: SHA-256 digests, format
   identification by magic bytes (ELF, Mach-O, PE, ZIP, PNG, WASM, DEX,
-  SQLite, ...), text statistics, `package.json` manifests, Electron
-  classification, entry points, source map references, printable strings
-  (redacted).
+  SQLite, ...; asar by structural check), text statistics, `package.json`
+  manifests, Electron classification, entry points, source map references,
+  printable strings (redacted).
+* **Parse native binaries structurally**: ELF (32/64-bit, both endians —
+  header, sections, `.dynsym` undefined imports) and PE/COFF (PE32/PE32+ —
+  headers, sections, import/export tables). Structural only, honestly:
+  no disassembly or decompilation, and the runs say so.
+* **Inventory .NET assemblies**: runtime version, entry-point token, and
+  the metadata streams (`#~`, `#Strings`, `#US`, `#GUID`, `#Blob`) from
+  the PE/CLI header — an inventory, not a decompiler.
+* **Read Android DEX**: version, table counts, defined classes, and an
+  adler32 checksum verification — including `classes*.dex` members inside
+  APKs, with findings located at `archive!member` addresses.
+* **List archive members** (zip/jar/apk and Electron asar) read-only:
+  member listings, APK shape detection from member names, and safety
+  observations (compression-bomb suspects, traversal/absolute names,
+  symlink members, unsupported methods, encryption). Members are read in
+  memory under hard caps — **never extracted to disk**.
 * **Search** literal text (case-insensitive by default) across supported
   files with `file:line:column` locations and redacted context lines;
   binary files are skipped and counted.
@@ -385,7 +400,7 @@ Full analysis, including residual risks and what Vortex-RE deliberately is
 ## Testing instructions
 
 ```bash
-cargo test --workspace             # 236 tests at the time of writing
+cargo test --workspace             # 284 tests at the time of writing
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
@@ -426,7 +441,14 @@ The acceptance bar for the MVP, with the evidence that meets it:
 | CLI and MCP agree on errors | parity suite (`tests/parity.rs`) runs both surfaces on identical inputs |
 | Signed exports verify | `signed_export_round_trip_through_the_cli` (CLI suite) |
 | Config precedence holds | `config_flag_overrides_and_fails_loudly` (CLI suite) |
-| Tests cover functionality | 236 tests, incl. golden, protocol, parity, and adversarial suites |
+| ELF/PE structure parses with exact evidence | `native.rs` suite against committed fixtures (`fixtures/native/`), cross-validated with `readelf`/`objdump` at creation |
+| .NET metadata inventory works | `dotnet_fixture_yields_cli_metadata_inventory` |
+| DEX header, checksum, and classes read | `dex_fixture_yields_verified_header_and_classes` |
+| Archive members listed, never extracted | `asar_fixture_lists_official_tool_archive` (fixture built by the official `asar` tool); zip suite |
+| APK → DEX chain works | `apk_zip_chain_reaches_dex_members` (findings at `archive!member` locations) |
+| Archive hazards reported | `zip_safety_findings_reach_the_report` (traversal, absolute, symlink) + bomb tests |
+| Unsupported depth still honest | Mach-O/WASM keep `unsupported_operation`; truncated ELF/PE warn with reasons |
+| Tests cover functionality | 284 tests, incl. golden, protocol, parity, adversarial, and native suites |
 | No known ignored security issue | docs/THREAT_MODEL.md tracks residual risks explicitly |
 
 ## Tested platforms
@@ -442,8 +464,11 @@ The acceptance bar for the MVP, with the evidence that meets it:
 Phase One (v0.1.0, working MVP) → Phase Two (**shipped**: automatic crash
 recovery, resumable runs, protocol-level cancellation, signed exports +
 ledger, parity tests, adversarial corpus, config file with per-provider
-timeouts) → Phase Three (broader static analysis: safe archive extraction,
-native structural parsing, Rizin after license review) → Phase Four
+timeouts) → Phase Three (**shipped**: bounded in-memory archive access for
+zip/jar/apk/asar with a written safety review — no disk extraction, ever;
+structural parsing for ELF and PE/COFF; .NET metadata inventory; DEX
+reading with verified checksums, including inside APKs; the Rizin provider
+deliberately deferred with its license review documented) → Phase Four
 (source map reconstruction, deeper comparisons) → Phase Five (controlled
 dynamic analysis) → Phase Six (patch-and-verify labs). Details and
 acceptance criteria per phase: [docs/ROADMAP.md](docs/ROADMAP.md).

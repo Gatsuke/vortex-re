@@ -26,7 +26,9 @@ vortex-re/
 │   │                      # and the append-only export ledger.
 │   ├── vortex-providers/  # Provider abstraction + the built-in static
 │   │                      # analysis provider (identification, strings,
-│   │                      # JS/JSON/manifest scanning, search, walk).
+│   │                      # JS/JSON/manifest scanning, search, walk, plus
+│   │                      # native/ and archive/ structural parsers:
+│   │                      # ELF, PE/COFF + .NET metadata, DEX, zip, asar).
 │   └── vortex-service/    # The application service layer: run lifecycle,
 │                          # provider dispatch, evidence retrieval, doctor.
 └── apps/vortex/           # The `vortex` binary: clap CLI, human
@@ -122,17 +124,24 @@ Capabilities and their implementation:
 | `inspect_directories` | Deterministic bounded walk (sorted DFS, symlinks never followed), per-file identification, extension/format census, manifest + entry-point + Electron classification findings, bounded notable findings |
 | `search_text` | Literal search (case-insensitive by default), grep-like one-match-per-line, per-file and global caps, redacted context lines, binary files skipped and counted |
 | `trace_relationships` | Import/require/dynamic-import/export-from scanning, Node-style relative resolution (exact / `.js` / `.json` / `index.js`), builtin + declared-dependency classification, source map reference resolution, HTML `<script src>` resolution, unknowns for every unresolved local reference |
-| `identify_binary_formats` | Magic-byte table: ELF, Mach-O (32/64/fat), PE, ZIP, gzip, PNG, JPEG, GIF, PDF, WASM, DEX, SQLite, tar |
+| `identify_binary_formats` | Magic-byte table: ELF, Mach-O (32/64/fat), PE, ZIP, gzip, PNG, JPEG, GIF, PDF, WASM, DEX, SQLite, tar; asar by structural pickle shape |
 | `extract_strings` | ASCII printable runs, bounded by count and length, redacted |
 | `parse_package_manifest` | Tolerant `package.json` parsing; malformed fields become warnings, never aborts |
 | `parse_javascript` | Line-oriented heuristic scanner — deliberately not a JS parser; limitations recorded in every run |
+| `inspect_archives` | zip/jar/apk member listing from the central directory only; safety observations (bomb suspects, traversal/absolute names, symlinks, unsupported methods, encryption); bounded in-memory member reads (never disk extraction); asar listing from the JSON header with the official tool's pickle layout |
+| `parse_elf` | 32/64-bit, both endians; header, section table with extended-numbering escapes, `.dynsym` undefined symbols; every table bounds-checked against the bytes read |
+| `parse_pe` | PE32/PE32+ headers, sections, import table (ordinals counted not fabricated), exports, RVA mapping through sections; .NET CLR header + BSJB metadata stream inventory |
+| `parse_dex` | Header, all table counts, adler32 verified as a derived observation when the whole file was read, defined-class list via the documented table chain; inside APKs with findings at `archive!member` locations |
 
 ### Honest degradation example
 
-Inspecting an ELF binary returns real work (identity, digest, format,
+Inspecting a Mach-O binary returns real work (identity, digest, format,
 strings) **and** an explicit `unsupported_operation` error plus a limitation
 naming the missing native-analysis provider. The run status is `partial`,
-and the CLI exits 6. It never fabricates disassembly.
+and the CLI exits 6. It never fabricates disassembly. A *truncated* ELF or
+PE, by contrast, is a different story now that parsers exist: the run
+completes with a warning and a limitation saying exactly which structure
+could not be read and why.
 
 ## Evidence storage
 
