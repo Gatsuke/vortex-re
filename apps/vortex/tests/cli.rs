@@ -620,3 +620,95 @@ fn runs_recover_reports_left_running_entries() {
     assert!(value["recovered"].as_array().unwrap().is_empty());
     assert!(value["left_running"].as_array().unwrap().is_empty());
 }
+
+/// Signed exports through the CLI: export --signed, verify, tamper detection.
+#[test]
+fn signed_export_round_trip_through_the_cli() {
+    // One shared home across the whole lifecycle.
+    let home = tempfile::tempdir().expect("shared home");
+    let fixture = fixture().to_str().unwrap().to_string();
+
+    let run = run_vortex_shared(home.path(), &["inspect", &fixture, "--json"], None);
+    assert!(
+        run.output.status.success(),
+        "stderr: {}",
+        stderr(&run.output)
+    );
+    let run_id = stdout_json(&run.output)["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = home.path().join("exports").join("record.json");
+    let run = run_vortex_shared(
+        home.path(),
+        &[
+            "evidence",
+            "export",
+            &run_id,
+            "--out",
+            out.to_str().unwrap(),
+            "--signed",
+        ],
+        None,
+    );
+    assert!(
+        run.output.status.success(),
+        "stderr: {}",
+        stderr(&run.output)
+    );
+    assert!(out.exists());
+    assert!(home.path().join("exports/record.json.sig").exists());
+    assert!(home.path().join("exports-ledger.jsonl").exists());
+
+    // Verify through the CLI.
+    let run = run_vortex_shared(
+        home.path(),
+        &["evidence", "verify", out.to_str().unwrap(), "--json"],
+        None,
+    );
+    assert!(run.output.status.success());
+    let verified = stdout_json(&run.output);
+    assert_eq!(verified["verified"], true);
+    assert_eq!(verified["run_id"], run_id.as_str());
+
+    // Tamper with the payload: verification must fail with a clear error.
+    let tampered = home.path().join("exports/tampered.json");
+    let mut body = std::fs::read_to_string(&out).unwrap();
+    let cut = body.find("\"findings\"").expect("findings field");
+    body.replace_range(cut..cut + 9, "\"Findings\"");
+    std::fs::write(&tampered, body).unwrap();
+    std::fs::copy(
+        home.path().join("exports/record.json.sig"),
+        home.path().join("exports/tampered.json.sig"),
+    )
+    .unwrap();
+    let run = run_vortex_shared(
+        home.path(),
+        &["evidence", "verify", tampered.to_str().unwrap(), "--json"],
+        None,
+    );
+    assert_eq!(run.output.status.code(), Some(1));
+    let error = stdout_json(&run.output);
+    assert_eq!(error["error"]["code"], "validation");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("does not match the recorded digest"));
+    assert!(error["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("modified after signing"));
+
+    // The doctor reports the signing key and the ledger.
+    let run = run_vortex_shared(home.path(), &["doctor", "--json"], None);
+    let report = stdout_json(&run.output);
+    let names: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"signing_key"));
+    assert!(names.contains(&"export_ledger"));
+}

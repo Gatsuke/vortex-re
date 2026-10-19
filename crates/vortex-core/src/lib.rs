@@ -11,6 +11,7 @@ pub mod limits;
 pub mod paths;
 pub mod process;
 pub mod redact;
+pub mod signing;
 pub mod timeutil;
 
 /// Canonical application name.

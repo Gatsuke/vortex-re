@@ -317,6 +317,73 @@ pub fn run_doctor(service: &VortexService) -> DoctorReport {
         });
     }
 
+    // Signing key for --signed exports.
+    {
+        let public_key_file = service.config().data_dir.join("keys").join("signing.pub");
+        let status = if public_key_file.exists() {
+            match std::fs::read_to_string(&public_key_file) {
+                Ok(hex) if hex.trim().len() == 64 => CheckStatus::Ok,
+                Ok(_) => CheckStatus::Warn,
+                Err(_) => CheckStatus::Warn,
+            }
+        } else {
+            CheckStatus::Info
+        };
+        let detail = if public_key_file.exists() {
+            std::fs::read_to_string(&public_key_file)
+                .unwrap_or_default()
+                .trim()
+                .chars()
+                .take(16)
+                .collect::<String>()
+        } else {
+            "not generated; exports are unsigned until 'evidence export --signed' is used"
+                .to_string()
+        };
+        checks.push(CheckResult {
+            name: "signing_key".to_string(),
+            status,
+            detail: format!("ed25519 public key: {detail}"),
+            hint: None,
+        });
+    }
+
+    // Export ledger chain.
+    {
+        let ledger = service.export_ledger_status();
+        let status = if ledger.valid {
+            if ledger.entries == 0 {
+                CheckStatus::Info
+            } else {
+                CheckStatus::Ok
+            }
+        } else {
+            CheckStatus::Fail
+        };
+        checks.push(CheckResult {
+            name: "export_ledger".to_string(),
+            status,
+            detail: if ledger.valid {
+                format!("{} export(s) recorded, chain verifies", ledger.entries)
+            } else {
+                format!(
+                    "chain broken at entry {:?}: {}",
+                    ledger.first_broken_seq,
+                    ledger.reason.as_deref().unwrap_or("unknown reason")
+                )
+            },
+            hint: if ledger.valid {
+                None
+            } else {
+                Some(
+                    "a recorded export entry was modified after the fact; find the tampered \
+                     export and re-verify from a trusted copy"
+                        .to_string(),
+                )
+            },
+        });
+    }
+
     // Providers.
     let capabilities = service.capabilities();
     for provider in &capabilities.providers {

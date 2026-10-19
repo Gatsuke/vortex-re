@@ -191,6 +191,22 @@ pub enum EvidenceCommand {
         /// Export format (only `json` is supported).
         #[arg(long, default_value = "json")]
         format: String,
+        /// Also write an Ed25519 signature sidecar (`<out>.sig`) and append
+        /// to the export ledger.
+        #[arg(long)]
+        signed: bool,
+    },
+    /// Verify a signed export against its Ed25519 signature.
+    Verify {
+        /// Path of the exported JSON (the `.sig` sidecar must sit next to it).
+        file: PathBuf,
+        /// Verify against this public key (128 hex chars) instead of the
+        /// key recorded in the sidecar. Third parties pass the exporter's key.
+        #[arg(long)]
+        key: Option<String>,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 

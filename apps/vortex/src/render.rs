@@ -478,6 +478,16 @@ pub fn render_resume(operation: &str, result: &OperationResult, detail: Option<&
     out
 }
 
+/// Render a verified export.
+pub fn render_verify(outcome: &vortex_service::service::VerifiedExport) -> String {
+    format!(
+        "Verified: run {}\n  payload sha256: {}\n  public key: {}\n",
+        outcome.run_id,
+        &outcome.payload_sha256[..16.min(outcome.payload_sha256.len())],
+        &outcome.public_key_hex[..16.min(outcome.public_key_hex.len())]
+    )
+}
+
 /// Render not-supported entries as a shared helper (also used by tests).
 pub fn render_not_supported(entries: &[NotSupported]) -> String {
     entries

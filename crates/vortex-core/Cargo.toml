@@ -7,6 +7,8 @@ license.workspace = true
 description = "Shared types, configuration, validation, and error definitions for Vortex-RE"
 
 [dependencies]
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -17,3 +19,6 @@ time = { workspace = true }
 # shim, no runtime engine; Unix-only because the probe is a Unix concept.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

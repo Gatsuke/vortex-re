@@ -316,6 +316,7 @@ async fn run_command(command: Command) -> ExitCode {
                 run_id,
                 out,
                 format,
+                signed,
             } => {
                 if format != "json" {
                     let err =
@@ -323,12 +324,48 @@ async fn run_command(command: Command) -> ExitCode {
                             .with_hint("the only supported format is 'json'");
                     return error_exit(err, false);
                 }
-                match service.export_run_record(&run_id, &out) {
-                    Ok(path) => {
-                        eprintln!("[vortex] exported run {run_id} to {}", path.display());
+                if signed {
+                    match service.export_run_signed(&run_id, &out) {
+                        Ok(export) => {
+                            eprintln!(
+                                "[vortex] exported run {} to {}",
+                                export.run_id,
+                                export.payload_path.display()
+                            );
+                            eprintln!(
+                                "[vortex] signature: {} (public key {})",
+                                export.signature_path.display(),
+                                &export.public_key_hex[..16.min(export.public_key_hex.len())]
+                            );
+                            if export.key_generated {
+                                eprintln!("[vortex] note: a new signing key was generated for this machine");
+                            }
+                            eprintln!("[vortex] ledger entry #{} appended", export.ledger_seq);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => error_exit(err, false),
+                    }
+                } else {
+                    match service.export_run_record(&run_id, &out) {
+                        Ok(path) => {
+                            eprintln!("[vortex] exported run {run_id} to {}", path.display());
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => error_exit(err, false),
+                    }
+                }
+            }
+            EvidenceCommand::Verify { file, key, json } => {
+                match service.verify_signed_export(&file, key.as_deref()) {
+                    Ok(outcome) => {
+                        if json {
+                            print_json(&serde_json::to_value(&outcome).unwrap_or_default());
+                        } else {
+                            println!("{}", render::render_verify(&outcome));
+                        }
                         ExitCode::SUCCESS
                     }
-                    Err(err) => error_exit(err, false),
+                    Err(err) => error_exit(err, json),
                 }
             }
         },
