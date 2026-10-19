@@ -476,6 +476,12 @@ pub fn run_doctor(service: &VortexService) -> DoctorReport {
                 .to_string(),
             "identify binary formats by magic bytes".to_string(),
             "extract printable strings from binary files (redacted)".to_string(),
+            "list zip/jar/apk and Electron asar archive members (read-only, bounded, in-memory)"
+                .to_string(),
+            "parse ELF and PE/COFF structure (headers, sections, imports/exports)".to_string(),
+            "read Android DEX headers, counts, and class inventories (also inside APKs)"
+                .to_string(),
+            "inventory .NET assembly metadata (runtime, entry point, metadata streams)".to_string(),
             "persist, list, page through, export, and compare evidence runs".to_string(),
             "serve MCP tools over stdio".to_string(),
         ],

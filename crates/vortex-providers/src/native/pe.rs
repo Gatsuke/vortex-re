@@ -9,6 +9,7 @@
 //! no type-system reconstruction.
 
 use super::reader::{Reader, MAX_NAME_BYTES};
+use time::format_description::well_known::Rfc3339;
 
 /// Hard caps (bounds checks against the buffer are the primary defense;
 /// these bound work on headers whose tables are present but huge).
@@ -29,6 +30,8 @@ pub struct PeSection {
     pub raw_size: u32,
     /// `PointerToRawData` (file offset).
     pub raw_pointer: u32,
+    /// Section characteristics, raw.
+    pub characteristics: u32,
 }
 
 /// One imported DLL with its function names (bounded).
@@ -76,6 +79,8 @@ pub struct PeFile {
     pub machine: u16,
     /// COFF `TimeDateStamp` (raw; fixtures and reproducible builds use 0).
     pub timestamp: u32,
+    /// COFF `Characteristics`, raw.
+    pub characteristics: u16,
     /// Optional-header magic: `0x10b` (PE32) or `0x20b` (PE32+).
     pub magic: u16,
     /// `AddressOfEntryPoint` (RVA).
@@ -127,6 +132,35 @@ pub fn subsystem_name(value: u16) -> &'static str {
         14 => "EFI application",
         _ => "other",
     }
+}
+
+/// COFF characteristics flags worth naming.
+pub fn coff_characteristics_summary(value: u16) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if value & 0x0002 != 0 {
+        out.push("executable image");
+    }
+    if value & 0x0100 != 0 {
+        out.push("32-bit machine");
+    }
+    if value & 0x2000 != 0 {
+        out.push("DLL");
+    }
+    if value & 0x0020 != 0 {
+        out.push("large address aware");
+    }
+    out
+}
+
+/// PE timestamp as RFC 3339 when it is a plausible Unix time.
+pub fn timestamp_rfc3339(value: u32) -> Option<String> {
+    if value == 0 {
+        return None;
+    }
+    time::OffsetDateTime::from_unix_timestamp(i64::from(value))
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
 }
 
 /// Section characteristics flags worth naming in output.
@@ -203,6 +237,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeFile, String> {
     let mut file = PeFile {
         machine,
         timestamp,
+        characteristics,
         magic,
         entry_point,
         subsystem,
@@ -216,7 +251,6 @@ pub fn parse(bytes: &[u8]) -> Result<PeFile, String> {
         dotnet: None,
         dotnet_reason: None,
     };
-    let _ = characteristics; // reported via the header finding in builtin.rs
 
     // --- section table ------------------------------------------------------
     let table = dirs + 16 * 8;
@@ -412,6 +446,7 @@ fn read_section_table(r: &Reader, at: usize, count: usize) -> Option<Vec<PeSecti
             virtual_address: r.read_u32(row + 12)?,
             raw_size: r.read_u32(row + 16)?,
             raw_pointer: r.read_u32(row + 20)?,
+            characteristics: r.read_u32(row + 36)?,
         });
     }
     Some(out)

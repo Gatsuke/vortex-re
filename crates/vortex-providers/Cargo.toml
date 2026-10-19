@@ -12,6 +12,7 @@ vortex-evidence = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+time = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

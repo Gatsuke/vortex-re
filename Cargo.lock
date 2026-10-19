@@ -1248,6 +1248,7 @@ dependencies = [
  "vortex-evidence",
  "vortex-providers",
  "vortex-service",
+ "zip",
 ]
 
 [[package]]
@@ -1286,6 +1287,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "time",
  "vortex-core",
  "vortex-evidence",
  "zip",

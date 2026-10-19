@@ -401,18 +401,21 @@ fn binary_fixture_strings_are_redacted_in_findings() {
 #[test]
 fn unsupported_native_binary_is_reported_not_faked() {
     let dir = tempfile::tempdir().unwrap();
-    let elf = dir.path().join("program");
+    // Mach-O: still unsupported in this release — the original contract.
+    let macho = dir.path().join("program");
     std::fs::write(
-        &elf,
-        [0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &macho,
+        [
+            0xcf, 0xfa, 0xed, 0xfe, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
     )
     .unwrap();
 
     let (service, _dir2) = service_in_temp();
     let result = service
-        .inspect(&elf, &OperationOptions::default(), &CancelToken::new())
+        .inspect(&macho, &OperationOptions::default(), &CancelToken::new())
         .expect("inspect");
-    assert_eq!(result.report.summary["format"], "elf");
+    assert_eq!(result.report.summary["format"], "mach-o-64");
     assert!(result
         .report
         .errors

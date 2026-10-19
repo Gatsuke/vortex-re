@@ -11,8 +11,10 @@
 //! would need a native-analysis engine produce an explicit
 //! `unsupported_operation` limitation instead of fabricated results.
 
+use crate::archive::{self, MemberRead};
 use crate::identify::{self, FormatIdentification};
 use crate::javascript::{self, ImportRef, PackageManifest, SpecifierKind};
+use crate::native::{self, elf, pe};
 use crate::provider::{
     AnalysisProvider, AnalysisRequest, Capability, ProviderDescriptor, ProviderReport,
     ReportBuilder, SearchQuery, StopReason,
@@ -64,6 +66,10 @@ impl BuiltinStaticProvider {
                     Capability::ExtractStrings,
                     Capability::ParsePackageManifest,
                     Capability::ParseJavascript,
+                    Capability::InspectArchives,
+                    Capability::ParseElf,
+                    Capability::ParsePe,
+                    Capability::ParseDex,
                 ],
             },
         }
@@ -561,11 +567,23 @@ fn inspect_file(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde_json:
                 "strings": values,
             }),
         );
-        builder.limitation(
-            "binary content: identification and printable-string extraction only; no \
-             disassembly or decompilation is performed by the built-in provider",
+        let structural = matches!(
+            identification.format.as_str(),
+            "elf" | "pe" | "dex" | "zip" | "asar-archive"
         );
+        if structural {
+            builder.limitation(
+                "binary content: printable strings plus structural parsing; no disassembly, \
+                 decompilation, or behavioral analysis is performed by the built-in provider",
+            );
+        } else {
+            builder.limitation(
+                "binary content: identification and printable-string extraction only; no \
+                 disassembly or decompilation is performed by the built-in provider",
+            );
+        }
         native_analysis_limitation(builder, &identification);
+        dispatch_structural_analysis(ctx, builder, &identification, &rel_path, &artifact, prefix);
     }
 
     let mut summary = serde_json::json!({
@@ -590,9 +608,12 @@ fn inspect_file(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde_json:
 }
 
 fn native_analysis_limitation(builder: &mut ReportBuilder, identification: &FormatIdentification) {
+    // ELF, PE, and DEX have structural parsers in this release; the formats
+    // below still need a native-analysis engine for anything beyond
+    // identification, strings, and (for Mach-O) nothing at all.
     let native = matches!(
         identification.format.as_str(),
-        "elf" | "pe" | "mach-o-32" | "mach-o-64" | "mach-o-fat" | "wasm" | "dex"
+        "mach-o-32" | "mach-o-64" | "mach-o-fat" | "wasm"
     );
     if native {
         builder.limitation(format!(
@@ -608,6 +629,669 @@ fn native_analysis_limitation(builder: &mut ReportBuilder, identification: &Form
             ),
             Some("inspect"),
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// structural analysis: dispatch + per-format finders
+// ---------------------------------------------------------------------------
+
+/// Run the format-specific structural parser for identified native and
+/// archive formats. Formats without a parser are ignored here (their
+/// unsupported_operation error was emitted above).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_structural_analysis(
+    ctx: &mut OpContext,
+    builder: &mut ReportBuilder,
+    identification: &FormatIdentification,
+    rel_path: &str,
+    artifact: &ArtifactRef,
+    prefix: &[u8],
+) {
+    match identification.format.as_str() {
+        "elf" => record_elf(builder, rel_path, artifact, prefix, ctx.limits()),
+        "pe" => record_pe(builder, rel_path, artifact, prefix, ctx.limits()),
+        "dex" => record_dex(builder, rel_path, artifact, prefix, ctx.limits()),
+        "zip" => record_zip(ctx, builder, rel_path, artifact),
+        "asar-archive" => record_asar(ctx, builder, rel_path, artifact),
+        _ => {}
+    }
+}
+
+fn record_elf(
+    builder: &mut ReportBuilder,
+    location: &str,
+    artifact: &ArtifactRef,
+    bytes: &[u8],
+    limits: &ResourceLimits,
+) {
+    match native::elf::parse(bytes) {
+        Ok(file) => {
+            let class = if file.class == 2 { "64-bit" } else { "32-bit" };
+            let endianness = if file.big_endian { "big" } else { "little" };
+            builder.finding(
+                "elf_header",
+                Origin::Observed,
+                format!(
+                    "{location}: {class} {endianness}-endian ELF, {}, {}, entry 0x{:x}",
+                    elf::elf_type_name(file.elf_type),
+                    elf::machine_name(file.machine),
+                    file.entry
+                ),
+                Some(Location::file(location)),
+                Some(artifact.clone()),
+                serde_json::json!({
+                    "class": class,
+                    "endianness": endianness,
+                    "type": elf::elf_type_name(file.elf_type),
+                    "type_raw": file.elf_type,
+                    "machine": elf::machine_name(file.machine),
+                    "machine_raw": file.machine,
+                    "os_abi": elf::osabi_name(file.os_abi),
+                    "os_abi_raw": file.os_abi,
+                    "entry_point": file.entry,
+                    "program_headers": file.phnum,
+                    "section_count": file.section_total,
+                }),
+            );
+            if !file.sections.is_empty() {
+                let truncated = file.sections.len() > limits.max_entries;
+                let sections: Vec<_> = file
+                    .sections
+                    .iter()
+                    .take(limits.max_entries)
+                    .map(|s| {
+                        serde_json::json!({
+                            "name": s.name,
+                            "type": elf::section_type_name(s.sh_type),
+                            "type_raw": s.sh_type,
+                            "size": s.size,
+                            "offset": s.offset,
+                        })
+                    })
+                    .collect();
+                builder.finding(
+                    "elf_sections",
+                    Origin::Observed,
+                    format!(
+                        "{location}: {} section(s) listed of {}",
+                        sections.len(),
+                        file.section_total
+                    ),
+                    Some(Location::file(location)),
+                    Some(artifact.clone()),
+                    serde_json::json!({
+                        "count": file.sections.len(),
+                        "total": file.section_total,
+                        "truncated": truncated,
+                        "sections": sections,
+                    }),
+                );
+            } else if let Some(reason) = &file.sections_reason {
+                builder.limitation(format!(
+                    "{location}: ELF section table unavailable: {reason}"
+                ));
+            }
+            if !file.imports.is_empty() {
+                let truncated = file.imports.len() > limits.max_entries;
+                let imports: Vec<&str> = file
+                    .imports
+                    .iter()
+                    .take(limits.max_entries)
+                    .map(String::as_str)
+                    .collect();
+                builder.finding(
+                    "elf_imports",
+                    Origin::Observed,
+                    format!(
+                        "{location}: {} undefined dynamic symbol(s)",
+                        file.imports.len()
+                    ),
+                    Some(Location::file(location)),
+                    Some(artifact.clone()),
+                    serde_json::json!({
+                        "count": file.imports.len(),
+                        "truncated": truncated,
+                        "symbols": imports,
+                    }),
+                );
+            } else if let Some(reason) = &file.imports_reason {
+                builder.limitation(format!("{location}: ELF imports unavailable: {reason}"));
+            }
+            builder.limitation(format!(
+                "{location}: ELF analysis is structural only — header, sections, and undefined \
+                 dynamic symbols; no disassembly, decompilation, relocation analysis, or \
+                 behavioral claims"
+            ));
+        }
+        Err(reason) => {
+            builder.warning(format!(
+                "{location}: identified as ELF but structural parsing failed: {reason}"
+            ));
+            builder.limitation(format!("{location}: ELF structure unavailable ({reason})"));
+        }
+    }
+}
+
+fn record_pe(
+    builder: &mut ReportBuilder,
+    location: &str,
+    artifact: &ArtifactRef,
+    bytes: &[u8],
+    limits: &ResourceLimits,
+) {
+    match native::pe::parse(bytes) {
+        Ok(file) => {
+            let format = if file.magic == 0x20B { "PE32+" } else { "PE32" };
+            builder.finding(
+                "pe_header",
+                Origin::Observed,
+                format!(
+                    "{location}: {format} image, {}, {}",
+                    pe::machine_name(file.machine),
+                    pe::subsystem_name(file.subsystem)
+                ),
+                Some(Location::file(location)),
+                Some(artifact.clone()),
+                serde_json::json!({
+                    "format": format,
+                    "machine": pe::machine_name(file.machine),
+                    "machine_raw": file.machine,
+                    "characteristics": pe::coff_characteristics_summary(file.characteristics),
+                    "characteristics_raw": file.characteristics,
+                    "timestamp": file.timestamp,
+                    "timestamp_rfc3339": pe::timestamp_rfc3339(file.timestamp),
+                    "entry_point_rva": file.entry_point,
+                    "subsystem": pe::subsystem_name(file.subsystem),
+                    "subsystem_raw": file.subsystem,
+                    "section_count": file.sections.len(),
+                    "managed": file.dotnet.is_some(),
+                }),
+            );
+            if !file.sections.is_empty() {
+                let truncated = file.sections.len() > limits.max_entries;
+                let sections: Vec<_> = file
+                    .sections
+                    .iter()
+                    .take(limits.max_entries)
+                    .map(|s| {
+                        serde_json::json!({
+                            "name": s.name,
+                            "virtual_size": s.virtual_size,
+                            "virtual_address": s.virtual_address,
+                            "raw_size": s.raw_size,
+                            "flags": pe::section_flags_summary(s.characteristics),
+                        })
+                    })
+                    .collect();
+                builder.finding(
+                    "pe_sections",
+                    Origin::Observed,
+                    format!("{location}: {} section(s)", file.sections.len()),
+                    Some(Location::file(location)),
+                    Some(artifact.clone()),
+                    serde_json::json!({
+                        "count": file.sections.len(),
+                        "truncated": truncated,
+                        "sections": sections,
+                    }),
+                );
+            } else if let Some(reason) = &file.sections_reason {
+                builder.limitation(format!(
+                    "{location}: PE section table unavailable: {reason}"
+                ));
+            }
+            if !file.imports.is_empty() {
+                let truncated = file.imports.len() > limits.max_entries;
+                let imports: Vec<_> = file
+                    .imports
+                    .iter()
+                    .take(limits.max_entries)
+                    .map(|dll| {
+                        let functions_truncated = dll.functions.len() > limits.max_entries;
+                        serde_json::json!({
+                            "dll": dll.dll,
+                            "functions": dll.functions.iter().take(limits.max_entries)
+                                .collect::<Vec<_>>(),
+                            "function_count": dll.functions.len(),
+                            "functions_truncated": functions_truncated,
+                            "ordinal_imports": dll.ordinal_count,
+                        })
+                    })
+                    .collect();
+                builder.finding(
+                    "pe_imports",
+                    Origin::Observed,
+                    format!("{location}: {} imported DLL(s)", file.imports.len()),
+                    Some(Location::file(location)),
+                    Some(artifact.clone()),
+                    serde_json::json!({
+                        "count": file.imports.len(),
+                        "truncated": truncated,
+                        "imports": imports,
+                    }),
+                );
+            } else if let Some(reason) = &file.imports_reason {
+                builder.limitation(format!("{location}: PE imports unavailable: {reason}"));
+            }
+            if !file.exports.is_empty() {
+                let truncated = file.exports.len() > limits.max_entries;
+                let exports: Vec<&str> = file
+                    .exports
+                    .iter()
+                    .take(limits.max_entries)
+                    .map(String::as_str)
+                    .collect();
+                builder.finding(
+                    "pe_exports",
+                    Origin::Observed,
+                    format!("{location}: {} exported name(s)", file.exports.len()),
+                    Some(Location::file(location)),
+                    Some(artifact.clone()),
+                    serde_json::json!({
+                        "count": file.exports.len(),
+                        "truncated": truncated,
+                        "names": exports,
+                    }),
+                );
+            }
+            if let Some(dotnet) = &file.dotnet {
+                let streams: Vec<_> = dotnet
+                    .streams
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "name": s.name,
+                            "offset": s.offset,
+                            "size": s.size,
+                        })
+                    })
+                    .collect();
+                builder.finding(
+                    "dotnet_metadata",
+                    Origin::Observed,
+                    format!(
+                        "{location}: .NET assembly, runtime {}.{} ({}), {} metadata stream(s)",
+                        dotnet.runtime_version.0,
+                        dotnet.runtime_version.1,
+                        dotnet.version_string,
+                        dotnet.streams.len()
+                    ),
+                    Some(Location::file(location)),
+                    Some(artifact.clone()),
+                    serde_json::json!({
+                        "runtime_version": format!("{}.{}", dotnet.runtime_version.0, dotnet.runtime_version.1),
+                        "version_string": dotnet.version_string,
+                        "entry_point_token": format!("0x{:08x}", dotnet.entry_point_token),
+                        "flags": dotnet.flags,
+                        "streams": streams,
+                    }),
+                );
+                builder.limitation(format!(
+                    "{location}: .NET analysis is an inventory only — runtime version, \
+                     entry-point token, and metadata stream names/sizes; no type system, \
+                     CIL decoding, or member listing"
+                ));
+            } else if let Some(reason) = &file.dotnet_reason {
+                builder.limitation(format!("{location}: .NET metadata unavailable: {reason}"));
+            }
+            builder.limitation(format!(
+                "{location}: PE analysis is structural only — headers, sections, import and \
+                 export names; no disassembly, decompilation, or behavioral claims"
+            ));
+        }
+        Err(reason) => {
+            builder.warning(format!(
+                "{location}: identified as PE but structural parsing failed: {reason}"
+            ));
+            builder.limitation(format!("{location}: PE structure unavailable ({reason})"));
+        }
+    }
+}
+
+fn record_dex(
+    builder: &mut ReportBuilder,
+    location: &str,
+    artifact: &ArtifactRef,
+    bytes: &[u8],
+    limits: &ResourceLimits,
+) {
+    match native::dex::parse(bytes) {
+        Ok(file) => {
+            builder.finding(
+                "dex_header",
+                Origin::Observed,
+                format!(
+                    "{location}: DEX version {} with {} class definition(s)",
+                    file.version, file.counts.classes
+                ),
+                Some(Location::file(location)),
+                Some(artifact.clone()),
+                serde_json::json!({
+                    "version": file.version,
+                    "file_size": file.file_size,
+                    "declared_file_size": file.file_size,
+                    "available_bytes": file.available_bytes,
+                    "endian_tag_ok": file.endian_tag == 0x12345678,
+                    "counts": {
+                        "strings": file.counts.strings,
+                        "types": file.counts.types,
+                        "protos": file.counts.protos,
+                        "fields": file.counts.fields,
+                        "methods": file.counts.methods,
+                        "classes": file.counts.classes,
+                    },
+                }),
+            );
+            match file.checksum_matches {
+                Some(matches) => {
+                    let (summary, matches_flag) = if matches {
+                        ("adler32 checksum matches the file contents", true)
+                    } else {
+                        ("adler32 checksum DOES NOT match the file contents", false)
+                    };
+                    builder.finding(
+                        "dex_checksum",
+                        Origin::Derived,
+                        format!("{location}: {summary}"),
+                        Some(Location::file(location)),
+                        Some(artifact.clone()),
+                        serde_json::json!({
+                            "algorithm": "adler32",
+                            "stored": format!("0x{:08x}", file.stored_checksum),
+                            "computed": file.computed_checksum.map(|v| format!("0x{v:08x}")),
+                            "matches": matches_flag,
+                        }),
+                    );
+                }
+                None => {
+                    builder.limitation(format!(
+                        "{location}: DEX checksum not verified — the whole file was not read"
+                    ));
+                }
+            }
+            if let Some(reason) = &file.counts_reason {
+                builder.limitation(format!("{location}: DEX header concerns: {reason}"));
+            }
+            if !file.classes.is_empty() {
+                let truncated = file.classes.len() > limits.max_entries;
+                let classes: Vec<&str> = file
+                    .classes
+                    .iter()
+                    .take(limits.max_entries)
+                    .map(String::as_str)
+                    .collect();
+                builder.finding(
+                    "dex_classes",
+                    Origin::Observed,
+                    format!("{location}: {} defined class(es)", file.classes.len()),
+                    Some(Location::file(location)),
+                    Some(artifact.clone()),
+                    serde_json::json!({
+                        "count": file.classes.len(),
+                        "truncated": truncated,
+                        "classes": classes,
+                    }),
+                );
+            } else if let Some(reason) = &file.classes_reason {
+                builder.limitation(format!("{location}: DEX class list unavailable: {reason}"));
+            }
+            builder.limitation(format!(
+                "{location}: DEX analysis is structural only — header, table counts, and the \
+                 defined-class list; no bytecode, proto, field, or method analysis"
+            ));
+        }
+        Err(reason) => {
+            builder.warning(format!(
+                "{location}: identified as DEX but structural parsing failed: {reason}"
+            ));
+            builder.limitation(format!("{location}: DEX structure unavailable ({reason})"));
+        }
+    }
+}
+
+/// Zip-family archives: member listing, safety notes, and the APK → DEX
+/// chain (bounded reads of `classes*.dex` members).
+fn record_zip(
+    ctx: &mut OpContext,
+    builder: &mut ReportBuilder,
+    location: &str,
+    artifact: &ArtifactRef,
+) {
+    let abs = ctx.request.target.canonical.clone();
+    match archive::zip_reader::list(&abs, ctx.limits()) {
+        Ok(listing) => {
+            let mut methods: BTreeMap<&str, usize> = BTreeMap::new();
+            for member in &listing.members {
+                *methods.entry(member.method).or_insert(0) += 1;
+            }
+            let kind = if listing.looks_like_apk {
+                "zip (APK-shaped: AndroidManifest.xml and classes*.dex present)"
+            } else {
+                "zip"
+            };
+            builder.finding(
+                "archive",
+                Origin::Observed,
+                format!(
+                    "{location}: {kind} with {} member(s)",
+                    listing.total_members
+                ),
+                Some(Location::file(location)),
+                Some(artifact.clone()),
+                serde_json::json!({
+                    "format": "zip",
+                    "member_count": listing.total_members,
+                    "listed": listing.members.len(),
+                    "truncated": listing.truncated,
+                    "methods": methods,
+                    "looks_like_apk": listing.looks_like_apk,
+                }),
+            );
+            let members: Vec<_> = listing
+                .members
+                .iter()
+                .take(ctx.limits().max_entries)
+                .map(|m| {
+                    serde_json::json!({
+                        "name": m.name,
+                        "size": m.size,
+                        "compressed_size": m.compressed_size,
+                        "method": m.method,
+                        "readable": m.readable,
+                        "is_dir": m.is_dir,
+                    })
+                })
+                .collect();
+            builder.finding(
+                "archive_members",
+                Origin::Observed,
+                format!(
+                    "{location}: {} member(s) listed of {}",
+                    members.len(),
+                    listing.total_members
+                ),
+                Some(Location::file(location)),
+                Some(artifact.clone()),
+                serde_json::json!({
+                    "count": listing.members.len(),
+                    "total": listing.total_members,
+                    "truncated": listing.members.len() > ctx.limits().max_entries,
+                    "members": members,
+                }),
+            );
+            for note in &listing.safety {
+                builder.finding(
+                    "archive_safety",
+                    Origin::Derived,
+                    format!(
+                        "{location}: member {:?}: {}",
+                        note.member,
+                        note.kind.as_str()
+                    ),
+                    Some(Location::file(location)),
+                    Some(artifact.clone()),
+                    serde_json::json!({
+                        "kind": note.kind.as_str(),
+                        "member": note.member,
+                        "detail": note.detail,
+                    }),
+                );
+            }
+            for error in &listing.errors {
+                builder.warning(format!("{location}: {error}"));
+            }
+            // APK chain: read classes*.dex members (bounded) and parse them.
+            if listing.looks_like_apk {
+                let dex_members: Vec<&archive::zip_reader::ZipMember> = listing
+                    .members
+                    .iter()
+                    .filter(|m| archive::zip_reader::is_dex_member_name(&m.name))
+                    .collect();
+                let capped = dex_members.len().min(8);
+                if dex_members.len() > 8 {
+                    builder.limitation(format!(
+                        "{location}: {} DEX members found; only the first 8 were read",
+                        dex_members.len()
+                    ));
+                }
+                for member in dex_members.iter().take(capped) {
+                    if !member.readable {
+                        builder.warning(format!(
+                            "{location}: DEX member {} is not readable (method or encryption); skipped",
+                            member.name
+                        ));
+                        continue;
+                    }
+                    let limits = ctx.limits().clone();
+                    let read = archive::zip_reader::read_member(
+                        &abs,
+                        &member.name,
+                        &limits,
+                        &mut ctx.budget,
+                    );
+                    record_zip_member_dex(read, &member.name, location, artifact, builder, &limits);
+                }
+            }
+            builder.limitation(format!(
+                "{location}: archive members are read in memory under bounded budgets; nothing \
+                 is written to disk, nested archives are listed but not recursively inspected, \
+                 and text search does not enter archive members in this release"
+            ));
+        }
+        Err(reason) => {
+            builder.warning(format!(
+                "{location}: identified as a zip container but the archive could not be read: {reason}"
+            ));
+            builder.limitation(format!(
+                "{location}: archive members unavailable ({reason})"
+            ));
+        }
+    }
+}
+
+/// Handle one bounded DEX member read: full reads parse directly,
+/// truncated reads parse the prefix with an explicit limitation, failed
+/// reads warn and move on.
+fn record_zip_member_dex(
+    read: MemberRead,
+    member: &str,
+    location: &str,
+    artifact: &ArtifactRef,
+    builder: &mut ReportBuilder,
+    limits: &ResourceLimits,
+) {
+    match read {
+        MemberRead::Full(bytes) => {
+            let member_location = format!("{location}!{member}");
+            record_dex(builder, &member_location, artifact, &bytes, limits);
+        }
+        MemberRead::Truncated(bytes, full) => {
+            let member_location = format!("{location}!{member}");
+            builder.limitation(format!(
+                "{member_location}: DEX member is {full} bytes; only the first {} were read",
+                bytes.len()
+            ));
+            record_dex(builder, &member_location, artifact, &bytes, limits);
+        }
+        MemberRead::Failed(reason) => builder.warning(format!(
+            "{location}: DEX member {member} could not be read: {reason}"
+        )),
+    }
+}
+
+fn record_asar(
+    ctx: &mut OpContext,
+    builder: &mut ReportBuilder,
+    location: &str,
+    artifact: &ArtifactRef,
+) {
+    let abs = ctx.request.target.canonical.clone();
+    match archive::asar::list(&abs, ctx.limits()) {
+        Ok(listing) => {
+            builder.finding(
+                "archive",
+                Origin::Observed,
+                format!(
+                    "{location}: asar archive with {} member(s)",
+                    listing.total_members
+                ),
+                Some(Location::file(location)),
+                Some(artifact.clone()),
+                serde_json::json!({
+                    "format": "asar",
+                    "member_count": listing.total_members,
+                    "listed": listing.members.len(),
+                    "truncated": listing.truncated,
+                    "header_size": listing.header_size,
+                }),
+            );
+            let members: Vec<_> = listing
+                .members
+                .iter()
+                .take(ctx.limits().max_entries)
+                .map(|m| {
+                    serde_json::json!({
+                        "path": m.path,
+                        "size": m.size,
+                        "unpacked": m.unpacked,
+                        "executable": m.executable,
+                        "integrity": m.integrity,
+                    })
+                })
+                .collect();
+            builder.finding(
+                "archive_members",
+                Origin::Observed,
+                format!(
+                    "{location}: {} member(s) listed of {}",
+                    members.len(),
+                    listing.total_members
+                ),
+                Some(Location::file(location)),
+                Some(artifact.clone()),
+                serde_json::json!({
+                    "count": listing.members.len(),
+                    "total": listing.total_members,
+                    "truncated": listing.members.len() > ctx.limits().max_entries,
+                    "members": members,
+                }),
+            );
+            for error in &listing.errors {
+                builder.warning(format!("{location}: {error}"));
+            }
+            builder.limitation(format!(
+                "{location}: asar members are listed from the JSON header; packed content reads \
+                 are bounded and in memory, unpacked members (stored beside the archive) are \
+                 listed but not read, and nothing is written to disk"
+            ));
+        }
+        Err(reason) => {
+            builder.warning(format!(
+                "{location}: identified as an asar archive but it could not be read: {reason}"
+            ));
+            builder.limitation(format!("{location}: asar members unavailable ({reason})"));
+        }
     }
 }
 
@@ -2039,16 +2723,47 @@ mod tests {
     #[test]
     fn binary_target_reports_identification_and_unsupported_operation() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("program.bin");
+        // A truncated ELF: the parser exists now, so this is a warning and
+        // an honest limitation — not an unsupported_operation error.
+        let elf = dir.path().join("program.bin");
         std::fs::write(
-            &file,
+            &elf,
             [0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         )
         .unwrap();
-        let request = request_for(&file, ResourceLimits::default());
+        let request = request_for(&elf, ResourceLimits::default());
         let provider = BuiltinStaticProvider::new();
         let report = provider.inspect(&request);
         assert_eq!(report.summary["format"], serde_json::json!("elf"));
+        assert!(!report
+            .errors
+            .iter()
+            .any(|e| e.code == "unsupported_operation"));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("structural parsing failed")));
+        assert!(report
+            .limitations
+            .iter()
+            .any(|l| l.contains("ELF structure unavailable")));
+        assert!(!report.findings.iter().any(|f| f.kind == "elf_header"));
+        // Strings extraction still ran (empty strings are fine for this input).
+        assert!(report.findings.iter().any(|f| f.kind == "strings_sample"));
+
+        // Mach-O: still no parser in this release — the honest
+        // unsupported_operation error, exactly as before Phase 3.
+        let macho = dir.path().join("mach.bin");
+        std::fs::write(
+            &macho,
+            [
+                0xcf, 0xfa, 0xed, 0xfe, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+        let request = request_for(&macho, ResourceLimits::default());
+        let report = provider.inspect(&request);
+        assert_eq!(report.summary["format"], serde_json::json!("mach-o-64"));
         assert!(report
             .errors
             .iter()
@@ -2057,8 +2772,13 @@ mod tests {
             .limitations
             .iter()
             .any(|l| l.contains("native-analysis provider")));
-        // Strings extraction still ran (empty strings are fine for this input).
-        assert!(report.findings.iter().any(|f| f.kind == "strings_sample"));
+        for finding in &report.findings {
+            assert!(
+                matches!(finding.kind.as_str(), "file" | "format" | "strings_sample"),
+                "unexpected fabricated finding kind: {}",
+                finding.kind
+            );
+        }
     }
 
     #[test]

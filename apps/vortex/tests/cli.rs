@@ -383,15 +383,17 @@ fn runs_recover_reports_cleanly_when_nothing_is_stale() {
 #[test]
 fn binary_target_inspect_is_honest_about_support() {
     let dir = tempfile::tempdir().unwrap();
-    let elf = dir.path().join("app.bin");
+    // Mach-O: still unsupported — the run is deliberately PARTIAL (exit 6)
+    // with an unsupported_operation error, exactly as before Phase 3.
+    let macho = dir.path().join("app.bin");
     std::fs::write(
-        &elf,
-        [0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &macho,
+        [
+            0xcf, 0xfa, 0xed, 0xfe, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
     )
     .unwrap();
-    let run = run_vortex(&["inspect", elf.to_str().unwrap(), "--json"]);
-    // Identification and strings extraction are real work, but deeper native
-    // analysis is unsupported, so the run is deliberately PARTIAL (exit 6).
+    let run = run_vortex(&["inspect", macho.to_str().unwrap(), "--json"]);
     assert_eq!(
         run.output.status.code(),
         Some(6),
@@ -400,7 +402,7 @@ fn binary_target_inspect_is_honest_about_support() {
     );
     let value = stdout_json(&run.output);
     assert_eq!(value["status"], "partial");
-    assert_eq!(value["report"]["summary"]["format"], "elf");
+    assert_eq!(value["report"]["summary"]["format"], "mach-o-64");
     let codes: Vec<&str> = value["report"]["errors"]
         .as_array()
         .unwrap()
@@ -408,6 +410,25 @@ fn binary_target_inspect_is_honest_about_support() {
         .map(|e| e["code"].as_str().unwrap())
         .collect();
     assert!(codes.contains(&"unsupported_operation"));
+
+    // A truncated ELF is different in Phase 3: a parser exists, so a
+    // warning plus an honest limitation — a complete run, exit 0.
+    let elf = dir.path().join("elf.bin");
+    std::fs::write(
+        &elf,
+        [0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    )
+    .unwrap();
+    let run = run_vortex(&["inspect", elf.to_str().unwrap(), "--json"]);
+    assert_eq!(
+        run.output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&run.output)
+    );
+    let value = stdout_json(&run.output);
+    assert_eq!(value["status"], "succeeded");
+    assert!(String::from_utf8_lossy(&run.output.stdout).contains("ELF structure unavailable"));
 }
 
 #[test]

@@ -139,6 +139,28 @@ pub fn sniff_magic(bytes: &[u8]) -> Option<MagicFormat> {
     }
 }
 
+/// Sniff an Electron asar archive structurally. There is no fixed magic;
+/// the format opens with a Chromium pickle whose shape is checkable:
+/// payload length 4, a sane header-pickle length, a consistent payload
+/// size, and a JSON object starting right after.
+fn sniff_asar(bytes: &[u8]) -> bool {
+    if bytes.len() < 17 {
+        return false;
+    }
+    let le = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    if le(0) != 4 {
+        return false;
+    }
+    let header_pickle_len = le(4);
+    if !(8..=64 * 1024 * 1024).contains(&header_pickle_len) {
+        return false;
+    }
+    if le(8) + 4 != header_pickle_len {
+        return false;
+    }
+    bytes[16] == b'{'
+}
+
 /// Extension-based format hints for text-ish files.
 pub fn extension_format(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -198,6 +220,14 @@ pub fn identify(path: &Path, content_prefix: &[u8]) -> FormatIdentification {
             magic_hex: Some(hex_prefix(content_prefix, 8)),
         };
     }
+    if sniff_asar(content_prefix) {
+        return FormatIdentification {
+            format: "asar-archive".to_string(),
+            label: "Electron asar archive (structural check)".to_string(),
+            basis: "content",
+            magic_hex: Some(hex_prefix(content_prefix, 8)),
+        };
+    }
     if looks_like_text(content_prefix) {
         if let Some(format) = extension_format(path) {
             let label = match format {
@@ -232,6 +262,22 @@ pub fn identify(path: &Path, content_prefix: &[u8]) -> FormatIdentification {
             label: "plain text (no known extension)".to_string(),
             basis: "content",
             magic_hex: None,
+        };
+    }
+    // Binary content: an .asar extension is a weak hint the structural
+    // check above could not confirm; say so honestly and let the asar
+    // reader try (and report failure honestly if it is not one).
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("asar"))
+        == Some(true)
+    {
+        return FormatIdentification {
+            format: "asar-archive".to_string(),
+            label: "Electron asar archive (extension only; structure unconfirmed)".to_string(),
+            basis: "extension",
+            magic_hex: Some(hex_prefix(content_prefix, 8)),
         };
     }
     FormatIdentification {
@@ -298,6 +344,34 @@ mod tests {
         // reports the Mach-O FAT label (documented ambiguity) rather than
         // guessing between the two.
         assert_eq!(id.format, "mach-o-fat");
+    }
+
+    #[test]
+    fn asar_is_identified_structurally_and_by_extension() {
+        // Minimal structural shape: pickle payload 4, header pickle 8,
+        // payload 4, JSON length 4, then '{'.
+        let bytes = [
+            4u8, 0, 0, 0, // size-pickle payload length
+            8, 0, 0, 0, // header pickle length
+            4, 0, 0, 0, // header payload
+            4, 0, 0, 0, // JSON length
+            b'{', b'}', 0, 0,
+        ];
+        let id = identify_bytes("app.asar", &bytes);
+        assert_eq!(id.format, "asar-archive");
+        assert_eq!(id.basis, "content");
+
+        // Same pickle shape but not JSON: falls through to the extension
+        // hint for .asar files, honestly marked as unconfirmed.
+        let mut not_json = bytes;
+        not_json[16] = b'x';
+        let id = identify_bytes("app.asar", &not_json);
+        assert_eq!(id.format, "asar-archive");
+        assert_eq!(id.basis, "extension");
+
+        // Arbitrary binary with a different name: not an asar claim.
+        let id = identify_bytes("blob.bin", &not_json);
+        assert_eq!(id.format, "binary");
     }
 
     #[test]

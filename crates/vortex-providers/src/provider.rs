@@ -35,6 +35,14 @@ pub enum Capability {
     ParsePackageManifest,
     /// Line-oriented JavaScript scanning (imports, source maps).
     ParseJavascript,
+    /// List archive members (zip/jar/apk/asar), read-only and bounded.
+    InspectArchives,
+    /// ELF structural parsing (headers, sections, dynamic imports).
+    ParseElf,
+    /// PE/COFF structural parsing, including the .NET metadata inventory.
+    ParsePe,
+    /// Android DEX structural reading (header, counts, class inventory).
+    ParseDex,
 }
 
 impl Capability {
@@ -49,6 +57,10 @@ impl Capability {
             Capability::ExtractStrings => "extract_strings",
             Capability::ParsePackageManifest => "parse_package_manifest",
             Capability::ParseJavascript => "parse_javascript",
+            Capability::InspectArchives => "inspect_archives",
+            Capability::ParseElf => "parse_elf",
+            Capability::ParsePe => "parse_pe",
+            Capability::ParseDex => "parse_dex",
         }
     }
 
@@ -66,6 +78,16 @@ impl Capability {
             Capability::ParsePackageManifest => "Parse package.json manifests",
             Capability::ParseJavascript => {
                 "Line-oriented JavaScript scanning (imports, requires, source maps)"
+            }
+            Capability::InspectArchives => {
+                "List archive members (zip/jar/apk/asar) with bounded, read-only, in-memory access"
+            }
+            Capability::ParseElf => "ELF structural parsing: header, sections, dynamic imports",
+            Capability::ParsePe => {
+                "PE/COFF structural parsing: headers, sections, imports, .NET metadata inventory"
+            }
+            Capability::ParseDex => {
+                "Android DEX structural reading: header, counts, class inventory, checksum"
             }
         }
     }
