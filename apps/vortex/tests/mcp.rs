@@ -433,3 +433,146 @@ async fn unknown_tool_is_a_protocol_error() {
     }
     shutdown(client, server_handle).await;
 }
+
+/// Protocol-level cancellation: the client sends `notifications/cancelled`
+/// for an in-flight tool call; rmcp cancels the request-scoped token; the
+/// server maps that onto the analysis cancel token, the run stops at its
+/// next safe boundary, and the persisted record is `cancelled` with its
+/// partial findings retained — never `succeeded`.
+#[tokio::test]
+async fn protocol_cancellation_maps_to_run_cancellation() {
+    use rmcp::model::{
+        CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
+        ClientNotification, ClientRequest, ServerResult,
+    };
+    use rmcp::service::PeerRequestOptions;
+    use vortex_evidence::store::RunStore;
+
+    let (service, _home) = service_for_tests();
+    let tree_dir = tempfile::tempdir().expect("tree home");
+    let tree = tree_dir.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let payload = "require('./x.js');\n//# sourceMappingURL=x.map\n".repeat(32);
+    for i in 0..3000u32 {
+        std::fs::write(tree.join(format!("f{i:04}.js")), &payload).unwrap();
+    }
+
+    let (client, server_handle) = spawn_server(service.clone()).await;
+    let peer = client.peer();
+
+    // Fire the tool call through the cancellable-request API so we know
+    // the request id.
+    let params = CallToolRequestParams::new("vortex_inspect_artifact".to_string()).with_arguments(
+        serde_json::json!({ "path": tree })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+    let handle = peer
+        .send_cancellable_request(request, PeerRequestOptions::default())
+        .await
+        .expect("send request");
+    let request_id = handle.id.clone();
+    let response_task = tokio::spawn(async move {
+        match handle.rx.await {
+            Ok(Ok(ServerResult::CallToolResult(result))) => Ok(result),
+            Ok(Ok(other)) => Err(format!("unexpected response variant: {other:?}")),
+            Ok(Err(err)) => Err(format!("service error: {err}")),
+            Err(err) => Err(format!("channel: {err}")),
+        }
+    });
+
+    // Wait until the run has durably passed its first checkpoint (async
+    // yields so the server task keeps making progress on the single-threaded
+    // test runtime). A checkpoint means at least 25 files are analyzed and
+    // their findings are on disk — exactly the partial work that must be
+    // retained under cancellation.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut run_id = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(runs) = service.store().list(10) {
+            for running in &runs {
+                if running.status == vortex_evidence::RunStatus::Running {
+                    if let Ok(record) = service.store().load(&running.run_id) {
+                        if record.checkpoint.is_some() {
+                            run_id = Some(running.run_id.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if run_id.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let run_id = run_id.expect("a checkpointed running record must appear");
+
+    // Cancel the request at the protocol level.
+    let notification = CancelledNotification::new(CancelledNotificationParam::new(
+        Some(request_id),
+        Some("test cancellation".to_string()),
+    ));
+    peer.send_notification(ClientNotification::CancelledNotification(notification))
+        .await
+        .expect("send cancellation");
+
+    // Client-side, the call resolves immediately with a cancellation error
+    // (standard MCP semantics); the server keeps finishing its work.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), response_task)
+        .await
+        .expect("response within timeout")
+        .expect("response task");
+    match outcome {
+        Ok(result) => {
+            // The cancellation raced in late; the result itself must then
+            // report a cancelled run, never a successful one.
+            let payload = structured(&result);
+            assert_eq!(payload["status"], "cancelled");
+        }
+        Err(message) => {
+            assert!(
+                message.contains("task cancelled"),
+                "expected a cancellation error, got: {message}"
+            );
+        }
+    }
+
+    // Server-side, the run stops at its next safe boundary and the persisted
+    // record ends up 'cancelled' with partial findings retained. Poll until
+    // it reaches a final state.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let stored = service.store().load(&run_id).unwrap();
+        if stored.status != vortex_evidence::RunStatus::Running {
+            assert_eq!(
+                stored.status,
+                vortex_evidence::RunStatus::Cancelled,
+                "a cancelled run never records 'succeeded' (detail: {:?})",
+                stored.status_detail
+            );
+            assert!(
+                !stored.findings.is_empty(),
+                "partial findings must be retained under cancellation"
+            );
+            assert!(stored
+                .limitations
+                .iter()
+                .any(|l| l.contains("stopped early")));
+            assert!(
+                stored.checkpoint.is_some(),
+                "a cancelled run keeps its checkpoint for 'runs resume'"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run never reached a final state"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    shutdown(client, server_handle).await;
+}

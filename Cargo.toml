@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["v4"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio-util = "0.7"
 rmcp = { version = "3.5", features = ["client", "transport-io"] }
 tempfile = "3"
 

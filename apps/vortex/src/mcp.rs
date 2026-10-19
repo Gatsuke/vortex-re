@@ -21,9 +21,28 @@ use rmcp::ServerHandler;
 use rmcp::ServiceExt;
 use serde::Deserialize;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use vortex_core::error::VortexError;
 use vortex_providers::provider::CancelToken;
 use vortex_service::service::{EvidenceSection, OperationOptions, VortexService};
+
+/// Bridge an MCP protocol cancellation token to a Vortex-RE cancel token.
+///
+/// rmcp cancels the request-scoped `CancellationToken` when the client sends
+/// `notifications/cancelled` for that request (see the rmcp serve loop). The
+/// bridge task forwards that to the cooperative analysis token so the run
+/// stops at its next safe boundary; callers abort the bridge when the
+/// service call returns.
+fn bridge_cancellation(ct: &CancellationToken) -> (CancelToken, tokio::task::JoinHandle<()>) {
+    let vortex_cancel = CancelToken::new();
+    let watcher_cancel = vortex_cancel.clone();
+    let watcher_ct = ct.clone();
+    let watcher = tokio::spawn(async move {
+        watcher_ct.cancelled().await;
+        watcher_cancel.cancel();
+    });
+    (vortex_cancel, watcher)
+}
 
 /// The MCP server state.
 #[derive(Clone)]
@@ -186,6 +205,7 @@ impl VortexServer {
     pub async fn vortex_inspect_artifact(
         &self,
         Parameters(params): Parameters<InspectParams>,
+        ct: CancellationToken,
     ) -> Result<CallToolResult, ErrorData> {
         let service = self.service.clone();
         let path = params.path.clone();
@@ -195,10 +215,12 @@ impl VortexServer {
             timeout_secs: params.timeout_secs.map(|s| s.clamp(1, 600)),
             ..OperationOptions::default()
         };
+        let (cancel, bridge) = bridge_cancellation(&ct);
         let result = run_service(service.clone(), move |service| {
-            service.inspect(std::path::Path::new(&path), &options, &CancelToken::new())
+            service.inspect(std::path::Path::new(&path), &options, &cancel)
         })
         .await?;
+        bridge.abort();
 
         match result {
             Ok(operation) => {
@@ -254,6 +276,7 @@ impl VortexServer {
     pub async fn vortex_search_artifact(
         &self,
         Parameters(params): Parameters<SearchParams>,
+        ct: CancellationToken,
     ) -> Result<CallToolResult, ErrorData> {
         let service = self.service.clone();
         let path = params.path.clone();
@@ -265,15 +288,12 @@ impl VortexServer {
             ..OperationOptions::default()
         };
         let query = params.query.clone();
+        let (cancel, bridge) = bridge_cancellation(&ct);
         let result = run_service(service, move |service| {
-            service.search(
-                std::path::Path::new(&path),
-                &query,
-                &options,
-                &CancelToken::new(),
-            )
+            service.search(std::path::Path::new(&path), &query, &options, &cancel)
         })
         .await?;
+        bridge.abort();
 
         match result {
             Ok(operation) => {
@@ -303,6 +323,7 @@ impl VortexServer {
     pub async fn vortex_trace_relationships(
         &self,
         Parameters(params): Parameters<TraceParams>,
+        ct: CancellationToken,
     ) -> Result<CallToolResult, ErrorData> {
         let service = self.service.clone();
         let path = params.path.clone();
@@ -311,10 +332,12 @@ impl VortexServer {
             timeout_secs: params.timeout_secs.map(|s| s.clamp(1, 600)),
             ..OperationOptions::default()
         };
+        let (cancel, bridge) = bridge_cancellation(&ct);
         let result = run_service(service.clone(), move |service| {
-            service.relationships(std::path::Path::new(&path), &options, &CancelToken::new())
+            service.relationships(std::path::Path::new(&path), &options, &cancel)
         })
         .await?;
+        bridge.abort();
 
         match result {
             Ok(operation) => {
@@ -455,6 +478,7 @@ impl VortexServer {
     pub async fn vortex_resume_run(
         &self,
         Parameters(params): Parameters<ResumeRunParams>,
+        ct: CancellationToken,
     ) -> Result<CallToolResult, ErrorData> {
         let service = self.service.clone();
         let run_id = params.run_id.clone();
@@ -463,10 +487,12 @@ impl VortexServer {
             timeout_secs: params.timeout_secs.map(|s| s.clamp(1, 3600)),
             ..OperationOptions::default()
         };
+        let (cancel, bridge) = bridge_cancellation(&ct);
         let result = run_service(service, move |service| {
-            service.resume_run(&run_id, &options, &CancelToken::new())
+            service.resume_run(&run_id, &options, &cancel)
         })
         .await?;
+        bridge.abort();
         match result {
             Ok(operation) => {
                 let payload = serde_json::json!({
