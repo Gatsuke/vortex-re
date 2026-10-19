@@ -4,10 +4,10 @@
 //! and keeps large artifacts queryable. Limits are enforced by providers and
 //! any truncation is recorded as an explicit limitation, never silently.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Limits applied to a single analysis operation.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     /// Maximum number of files considered during a directory walk.
     pub max_files: usize,

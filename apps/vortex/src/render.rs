@@ -2,6 +2,7 @@
 //! trivially testable). JSON output is produced separately by serializing
 //! the underlying structures.
 
+use vortex_evidence::store::RecoveryReport;
 use vortex_evidence::{RunComparison, RunSummary};
 use vortex_service::doctor::{DoctorReport, NotSupported};
 use vortex_service::service::{CapabilityReport, EvidenceView, OperationResult};
@@ -431,17 +432,49 @@ pub fn render_capabilities(report: &CapabilityReport) -> String {
 }
 
 /// Render `runs recover` output.
-pub fn render_recovered(recovered: &[String], older_than_secs: u64) -> String {
-    if recovered.is_empty() {
-        return format!("No stale 'running' runs older than {older_than_secs}s found.\n");
+pub fn render_recovered(report: &RecoveryReport, older_than_secs: u64) -> String {
+    use vortex_evidence::store::{LeftRun, RecoveredRun};
+    let _ = older_than_secs;
+    let mut out = String::new();
+    if report.recovered.is_empty() && report.left_running.is_empty() && report.errors.is_empty() {
+        return "No interrupted 'running' runs found.\n".to_string();
     }
-    let mut out = format!(
-        "Marked {} stale run(s) as failed (not resumable in this version):\n",
-        recovered.len()
-    );
-    for run_id in recovered {
-        out.push_str(&format!("  {run_id}\n"));
+    if !report.recovered.is_empty() {
+        out.push_str(&format!(
+            "Marked {} interrupted run(s) as failed:\n",
+            report.recovered.len()
+        ));
+        for RecoveredRun {
+            run_id,
+            reason,
+            resumable,
+        } in &report.recovered
+        {
+            let flag = if *resumable { " [resumable]" } else { "" };
+            out.push_str(&format!("  {run_id}{flag}\n"));
+            out.push_str(&format!("    {reason}\n"));
+        }
     }
+    if !report.left_running.is_empty() {
+        out.push_str("Left as 'running' (not forced):\n");
+        for LeftRun { run_id, reason } in &report.left_running {
+            out.push_str(&format!("  {run_id}\n"));
+            out.push_str(&format!("    {reason}\n"));
+        }
+    }
+    for problem in &report.errors {
+        out.push_str(&format!("warning: {problem}\n"));
+    }
+    out
+}
+
+/// Render a `runs resume` result: the resume context plus the operation view.
+pub fn render_resume(operation: &str, result: &OperationResult, detail: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(detail) = detail {
+        out.push_str(&format!("Resume: {detail}\n"));
+    }
+    out.push_str(&render_operation(operation, result));
     out
 }
 

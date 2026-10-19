@@ -278,7 +278,7 @@ fn evidence_lifecycle_via_cli() {
     );
     let exported: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&export_target).unwrap()).unwrap();
-    assert_eq!(exported["schema_version"], 1);
+    assert_eq!(exported["schema_version"], vortex_evidence::SCHEMA_VERSION);
     assert_eq!(exported["run_id"], run_id.as_str());
     let _ = std::fs::remove_file(&export_target);
 
@@ -415,4 +415,208 @@ fn version_flag_works() {
     let run = run_vortex(&["--version"]);
     assert!(run.output.status.success());
     assert!(String::from_utf8_lossy(&run.output.stdout).contains("vortex"));
+}
+
+/// The Phase 2 acceptance story, end to end with the real binary:
+/// SIGKILL mid-run leaves a `running` record on disk; the next vortex
+/// process recovers it automatically, explains itself, and (when a
+/// checkpoint exists) points at `vortex runs resume`.
+#[test]
+fn kill_nine_mid_run_recovers_on_next_start() {
+    use std::process::Command;
+
+    let home = tempfile::tempdir().expect("temp home");
+    let tree = home.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    // Big enough that the run comfortably outlives the kill polling.
+    let payload = "require('./x.js');\n//# sourceMappingURL=x.map\n".repeat(64);
+    for i in 0..3000u32 {
+        std::fs::write(tree.join(format!("f{i:04}.js")), &payload).unwrap();
+    }
+
+    let mut child = Command::new(binary())
+        .args([
+            "inspect",
+            tree.to_str().unwrap(),
+            "--json",
+            "--timeout-secs",
+            "60",
+        ])
+        .env("VORTEX_HOME", home.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn vortex");
+
+    // Wait for the write-ahead `running` record to appear.
+    let runs_dir = home.path().join("runs");
+    let mut record_path = None;
+    for _ in 0..500 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if let Ok(entries) = std::fs::read_dir(&runs_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    record_path = Some(path);
+                    break;
+                }
+            }
+        }
+        if record_path.is_some() {
+            break;
+        }
+    }
+    let record_path =
+        record_path.expect("the running record must be written before analysis starts");
+
+    // Kill -9 mid-run.
+    child.kill().expect("SIGKILL the child");
+    let status = child.wait().expect("wait for the child");
+    assert!(!status.success(), "child must have died by signal");
+
+    // The record is stranded as 'running' on disk.
+    let stranded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+    assert_eq!(stranded["status"], "running");
+
+    // The next vortex process recovers it and says so.
+    let run = run_vortex_shared(home.path(), &["runs", "list", "--json"], None);
+    assert!(run.output.status.success());
+    let banner = stderr(&run.output);
+    assert!(
+        banner.contains("recovered an interrupted run from a previous session"),
+        "stderr banner: {banner}"
+    );
+    let listed = stdout_json(&run.output);
+    let entry = listed["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["status"] == "failed")
+        .expect("recovered run listed as failed");
+
+    // The record now explains itself.
+    let recovered: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+    let detail = recovered["status_detail"].as_str().unwrap();
+    assert!(detail.contains("no longer running"), "detail: {detail}");
+    let has_checkpoint = recovered
+        .get("checkpoint")
+        .map(|c| !c.is_null())
+        .unwrap_or(false);
+    if has_checkpoint {
+        assert!(
+            detail.contains("vortex runs resume"),
+            "resume hint: {detail}"
+        );
+        assert!(recovered["checkpoint"]["next_file_index"]
+            .as_u64()
+            .is_some());
+    }
+    let error_codes: Vec<&str> = recovered["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["code"].as_str().unwrap())
+        .collect();
+    assert!(error_codes.contains(&"recovered"));
+    assert_eq!(entry["run_id"], recovered["run_id"]);
+
+    // And the explanation is stable in later invocations (no re-recovery).
+    let again = run_vortex_shared(home.path(), &["runs", "list", "--json"], None);
+    let again_banner = stderr(&again.output);
+    assert!(
+        !again_banner.contains("recovered an interrupted run"),
+        "no double recovery: {again_banner}"
+    );
+}
+
+/// `runs resume` through the CLI surface, using an interrupted run created
+/// through the service in the same home.
+#[test]
+fn runs_resume_through_the_cli() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use vortex_providers::provider::CancelToken;
+    use vortex_service::service::{OperationOptions, VortexService};
+
+    let home = tempfile::tempdir().expect("temp home");
+    let tree = home.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    for i in 0..60u32 {
+        std::fs::write(
+            tree.join(format!("f{i:02}.js")),
+            format!("require('./x.js');\n//# sourceMappingURL=f{i:02}.map\n"),
+        )
+        .unwrap();
+    }
+
+    let config = vortex_core::config::VortexConfig {
+        data_dir: home.path().to_path_buf(),
+        limits: vortex_core::limits::ResourceLimits::default(),
+        allowed_roots: None,
+        notes: Vec::new(),
+    };
+    let service = VortexService::new(config).expect("service");
+
+    // Interrupt deterministically: cancel at the first checkpoint.
+    let cancel = CancelToken::new();
+    let fired = std::sync::Arc::new(AtomicBool::new(false));
+    let hook_flag = fired.clone();
+    let hook_cancel = cancel.clone();
+    let options = OperationOptions {
+        on_checkpoint: Some(std::sync::Arc::new(move |_cp| {
+            if !hook_flag.swap(true, Ordering::SeqCst) {
+                hook_cancel.cancel();
+            }
+        })),
+        ..OperationOptions::default()
+    };
+    use vortex_evidence::RunStatus;
+    let interrupted = service
+        .inspect(&tree, &options, &cancel)
+        .expect("first pass");
+    assert_eq!(interrupted.status, RunStatus::Cancelled);
+    let run_id = interrupted.run_id.expect("persisted");
+
+    // CLI resume with a raised time budget.
+    let run = run_vortex_shared(
+        home.path(),
+        &["runs", "resume", &run_id, "--json", "--timeout-secs", "120"],
+        None,
+    );
+    assert!(
+        run.output.status.success(),
+        "stderr: {}",
+        stderr(&run.output)
+    );
+    let value = stdout_json(&run.output);
+    assert_eq!(value["status"], "succeeded");
+    assert_eq!(value["run_id"], run_id.as_str());
+    assert_eq!(value["report"]["summary"]["file_count"], 60);
+
+    // Resuming a succeeded run is a clean validation error.
+    let run = run_vortex_shared(home.path(), &["runs", "resume", &run_id, "--json"], None);
+    assert_eq!(run.output.status.code(), Some(1));
+    let error = stdout_json(&run.output);
+    assert_eq!(error["error"]["code"], "validation");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("nothing to resume"));
+}
+
+/// `runs recover` reports the new owner-aware shape.
+#[test]
+fn runs_recover_reports_left_running_entries() {
+    let home = tempfile::tempdir().expect("temp home");
+    let run = run_vortex_shared(
+        home.path(),
+        &["runs", "recover", "--json", "--older-than-secs", "60"],
+        None,
+    );
+    assert!(run.output.status.success());
+    let value = stdout_json(&run.output);
+    assert_eq!(value["count"], 0);
+    assert!(value["recovered"].as_array().unwrap().is_empty());
+    assert!(value["left_running"].as_array().unwrap().is_empty());
 }

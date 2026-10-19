@@ -128,6 +128,15 @@ pub struct CompareRunsParams {
     pub run_id_b: String,
 }
 
+/// Parameters for `vortex_resume_run`.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ResumeRunParams {
+    /// Run id of an interrupted run with a checkpoint (see `vortex_list_runs`).
+    pub run_id: String,
+    /// Optional higher time budget for this pass, in seconds (1..=3600).
+    pub timeout_secs: Option<u64>,
+}
+
 /// Run a blocking service call inside the async tool handler.
 ///
 /// The outer `Result` covers protocol/infrastructure failures; the inner
@@ -435,6 +444,47 @@ impl VortexServer {
             Ok(comparison) => Ok(CallToolResult::structured(
                 serde_json::to_value(comparison).unwrap_or_default(),
             )),
+            Err(error) => Ok(tool_error(&error)),
+        }
+    }
+
+    /// Continue an interrupted run from its checkpoint.
+    #[tool(
+        description = "Continue an interrupted inspect or search run from its last durable checkpoint. Refuses when the artifact changed since the run was recorded, when no checkpoint exists, or while the original process may still be working. Reuses the recorded limits; only the time budget may be raised."
+    )]
+    pub async fn vortex_resume_run(
+        &self,
+        Parameters(params): Parameters<ResumeRunParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let service = self.service.clone();
+        let run_id = params.run_id.clone();
+        let options = OperationOptions {
+            invocation: "mcp:vortex_resume_run".to_string(),
+            timeout_secs: params.timeout_secs.map(|s| s.clamp(1, 3600)),
+            ..OperationOptions::default()
+        };
+        let result = run_service(service, move |service| {
+            service.resume_run(&run_id, &options, &CancelToken::new())
+        })
+        .await?;
+        match result {
+            Ok(operation) => {
+                let payload = serde_json::json!({
+                    "run_id": operation.run_id,
+                    "status": operation.status.as_str(),
+                    "summary": operation.report.summary,
+                    "counts": {
+                        "findings": operation.report.findings.len(),
+                        "relationships": operation.report.relationships.len(),
+                        "files_scanned": operation.report.counts.files_scanned,
+                        "files_skipped": operation.report.counts.files_skipped,
+                        "truncated": operation.report.counts.truncated,
+                    },
+                    "limitations": operation.report.limitations,
+                    "unknowns": operation.report.unknowns,
+                });
+                Ok(CallToolResult::structured(payload))
+            }
             Err(error) => Ok(tool_error(&error)),
         }
     }

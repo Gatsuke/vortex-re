@@ -132,14 +132,31 @@ pub enum RunsCommand {
         limit: usize,
     },
     /// Mark stale `running` runs (from crashed or interrupted processes)
-    /// as failed.
+    /// as failed. Startup recovery already does this for runs whose owner
+    /// process is dead; this command is the explicit override for ambiguous
+    /// cases (hung processes, unknown ages).
     Recover {
         /// Print machine-readable JSON.
         #[arg(long)]
         json: bool,
-        /// Treat `running` runs older than this many seconds as stale.
+        /// Treat `running` runs older than this many seconds as stale, even
+        /// when their owner process still appears alive.
         #[arg(long, default_value_t = 3600)]
         older_than_secs: u64,
+    },
+    /// Continue an interrupted run from its last durable checkpoint. Only
+    /// inspect and search runs over directories carry checkpoints; the
+    /// artifact must be unchanged since the run was recorded.
+    Resume {
+        /// Run id to resume (see `vortex runs list`).
+        run_id: String,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+        /// Raise the time budget for this pass, in seconds (all other limits
+        /// come from the recorded run and cannot change).
+        #[arg(long)]
+        timeout_secs: Option<u64>,
     },
 }
 

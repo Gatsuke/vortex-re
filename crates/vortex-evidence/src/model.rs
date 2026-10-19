@@ -1,4 +1,13 @@
-//! The versioned evidence data model (schema version 1).
+//! The versioned evidence data model.
+//!
+//! Schema history:
+//! * v1 — initial format (0.1.0).
+//! * v2 — adds optional `owner`, `limits`, `params`, `checkpoint`, and
+//!   `resumed` fields for crash recovery, resumable runs, and
+//!   reproducibility. All new fields are optional and omitted when unused,
+//!   so v1 records remain loadable and their identity (run ids, digests)
+//!   is never rewritten; see docs/EVIDENCE_FORMAT.md for the stability
+//!   policy.
 //!
 //! Field semantics:
 //! * `observed` facts come directly from the artifact bytes or a tool result.
@@ -14,7 +23,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Current evidence schema version.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Lowest schema version this tool can still load (older records are
+/// accepted and annotated with an `older_schema` load note, never rejected
+/// as corrupt — the #4436 lesson).
+pub const MIN_LOADABLE_SCHEMA_VERSION: u32 = 1;
 
 /// Origin classification for findings and relationships.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +300,75 @@ pub struct RunCounts {
     pub truncated: bool,
 }
 
+/// The process that created a run, recorded so crash recovery can ask the
+/// operating system whether it is still alive (schema v2+).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerProcess(
+    /// Opaque process identity; see `vortex_core::process`.
+    pub vortex_core::process::ProcessInfo,
+);
+
+/// Caller-supplied parameters that can change what a run finds (schema v2+).
+///
+/// Recorded separately from the effective limits so a resumed run can
+/// reconstruct the exact request that produced the earlier findings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationParams {
+    /// Search text, for `search` runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Case-sensitive matching, for `search` runs.
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// Caller override of the summary entry cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_entries: Option<usize>,
+    /// Caller override of the match cap (search only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_matches: Option<usize>,
+    /// Caller override of the time budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// A durable walk checkpoint written during long runs (schema v2+).
+///
+/// `next_file_index` counts into the deterministic (lexicographic) walk
+/// order, so a resumed run re-walks, skips to that index, and continues
+/// without re-analyzing completed files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCheckpoint {
+    /// Which loop the index refers to (currently `per_file_analysis`).
+    pub phase: String,
+    /// Index of the next file to analyze in the walk order.
+    pub next_file_index: usize,
+    /// Files fully analyzed before the checkpoint (across all passes).
+    pub files_scanned: usize,
+    /// Files skipped before the checkpoint (across all passes).
+    pub files_skipped: usize,
+    /// When the checkpoint was written (RFC 3339, UTC).
+    pub saved_at: String,
+    /// Read-budget left when the checkpoint was written; a resumed pass
+    /// starts with this instead of the full limit.
+    pub bytes_remaining: u64,
+    /// Search-only: matches still allowed under the recorded cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches_remaining: Option<u64>,
+}
+
+/// Bookkeeping for a run that was continued after an interruption
+/// (schema v2+).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumedInfo {
+    /// Total completed passes including the original attempt (1 = original,
+    /// 2 = original + one resume, ...).
+    pub attempts: u32,
+    /// The walk index the latest pass continued from.
+    pub from_checkpoint: usize,
+    /// Status the run held before the latest resume pass finalized it.
+    pub previous_status: String,
+}
+
 /// The durable record of one investigation operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceRun {
@@ -329,6 +412,29 @@ pub struct EvidenceRun {
     pub redactions: Vec<RedactionRecord>,
     /// Coverage counters.
     pub counts: RunCounts,
+    /// Process that created the run; used by crash recovery (schema v2+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<OwnerProcess>,
+    /// Effective resource limits for this run, recorded for reproducibility
+    /// (schema v2+). Every knob that can affect evidence belongs here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<vortex_core::limits::ResourceLimits>,
+    /// Caller parameters that can change findings (schema v2+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<OperationParams>,
+    /// Latest durable checkpoint during the walk (schema v2+). Cleared when
+    /// a run reaches a `succeeded` final state; retained on `failed`,
+    /// `cancelled`, and `partial` so the run can be resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<RunCheckpoint>,
+    /// Set when this run was continued by `runs resume` (schema v2+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed: Option<ResumedInfo>,
+    /// Load-time annotations (for example `older_schema`). Never serialized
+    /// and never persisted: they describe how *this* tool read the record,
+    /// not what the record says.
+    #[serde(skip)]
+    pub load_notes: Vec<String>,
 }
 
 impl EvidenceRun {
@@ -361,6 +467,12 @@ impl EvidenceRun {
             errors: Vec::new(),
             redactions: Vec::new(),
             counts: RunCounts::default(),
+            owner: None,
+            limits: None,
+            params: None,
+            checkpoint: None,
+            resumed: None,
+            load_notes: Vec::new(),
         }
     }
 
@@ -371,6 +483,22 @@ impl EvidenceRun {
         self.completed_at = Some(vortex_core::timeutil::now_rfc3339());
         self.counts.findings = self.findings.len();
         self.counts.relationships = self.relationships.len();
+        // A succeeded run is complete by definition: it must not advertise a
+        // half-done walk position. Non-successful finals keep their
+        // checkpoint so `runs resume` can continue from it.
+        if status == RunStatus::Succeeded {
+            self.checkpoint = None;
+        }
+    }
+
+    /// Record how this run came to its current state after being resumed.
+    pub fn mark_resumed(&mut self, from_checkpoint: usize, previous_status: RunStatus) {
+        let attempts = self.resumed.as_ref().map(|r| r.attempts).unwrap_or(1) + 1;
+        self.resumed = Some(ResumedInfo {
+            attempts,
+            from_checkpoint,
+            previous_status: previous_status.as_str().to_string(),
+        });
     }
 }
 

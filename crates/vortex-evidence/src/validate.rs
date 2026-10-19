@@ -5,17 +5,30 @@
 //! timestamps) and tolerant of unknown *details* payloads, which evolve with
 //! provider capabilities.
 
-use crate::model::{EvidenceRun, Origin, Resolution, RunStatus, SCHEMA_VERSION};
+use crate::model::{
+    EvidenceRun, Origin, Resolution, RunStatus, MIN_LOADABLE_SCHEMA_VERSION, SCHEMA_VERSION,
+};
 use std::collections::HashSet;
 
 /// Validate a run record. Returns every problem found, empty when valid.
+///
+/// Schema policy (the #4436 lesson, never again): records older than the
+/// current schema validate fine — they are *not* integrity mismatches; a
+/// newer schema than this tool understands is reported as exactly that.
 pub fn validate_run(run: &EvidenceRun) -> Vec<String> {
     let mut problems = Vec::new();
 
-    if run.schema_version != SCHEMA_VERSION {
+    if run.schema_version > SCHEMA_VERSION {
         problems.push(format!(
-            "schema_version is {} but this tool understands {SCHEMA_VERSION}",
-            run.schema_version
+            "schema_version is {}, newer than this tool understands ({}); the record was \
+             written by a newer vortex — upgrade to read it",
+            run.schema_version, SCHEMA_VERSION
+        ));
+    } else if run.schema_version < MIN_LOADABLE_SCHEMA_VERSION {
+        problems.push(format!(
+            "schema_version is {}, below the oldest loadable version ({}); the record is \
+             not a vortex evidence run",
+            run.schema_version, MIN_LOADABLE_SCHEMA_VERSION
         ));
     }
     if !run.run_id.starts_with("run-") || run.run_id.len() < 10 {
@@ -122,6 +135,35 @@ pub fn validate_run(run: &EvidenceRun) -> Vec<String> {
             run.counts.relationships,
             run.relationships.len()
         ));
+    }
+
+    // Checkpoint and resume invariants (schema v2+ fields on any version).
+    if run.status == RunStatus::Succeeded && run.checkpoint.is_some() {
+        problems.push(
+            "a succeeded run must not carry a walk checkpoint; only unfinished states do"
+                .to_string(),
+        );
+    }
+    if let Some(checkpoint) = &run.checkpoint {
+        if checkpoint.phase.trim().is_empty() {
+            problems.push("checkpoint.phase must be a non-empty string".to_string());
+        }
+    }
+    if let Some(resumed) = &run.resumed {
+        if resumed.attempts < 2 {
+            problems.push(format!(
+                "resumed.attempts is {} but a resumed run needs at least 2 passes",
+                resumed.attempts
+            ));
+        }
+        let known_status =
+            serde_json::from_value::<RunStatus>(serde_json::json!(resumed.previous_status)).is_ok();
+        if !known_status {
+            problems.push(format!(
+                "resumed.previous_status '{}' is not a known run status",
+                resumed.previous_status
+            ));
+        }
     }
 
     problems
@@ -238,9 +280,77 @@ mod tests {
     fn bad_schema_version_is_rejected() {
         let mut run = minimal_run();
         run.schema_version = 99;
+        let problems = validate_run(&run);
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("newer than this tool understands")));
+    }
+
+    #[test]
+    fn older_schema_versions_are_accepted() {
+        // The #4436 rule: v1 records stay loadable under v2+ tooling.
+        let mut run = minimal_run();
+        run.schema_version = 1;
+        assert!(validate_run(&run).is_empty(), "{:?}", validate_run(&run));
+    }
+
+    #[test]
+    fn zero_schema_is_rejected() {
+        let mut run = minimal_run();
+        run.schema_version = 0;
         assert!(validate_run(&run)
             .iter()
-            .any(|p| p.contains("schema_version")));
+            .any(|p| p.contains("not a vortex evidence run")));
+    }
+
+    #[test]
+    fn succeeded_run_must_not_keep_a_checkpoint() {
+        let mut run = minimal_run();
+        run.checkpoint = Some(RunCheckpoint {
+            phase: "per_file_analysis".to_string(),
+            next_file_index: 3,
+            files_scanned: 3,
+            files_skipped: 0,
+            saved_at: "2026-01-01T00:00:00Z".to_string(),
+            bytes_remaining: 4096,
+            matches_remaining: None,
+        });
+        let problems = validate_run(&run);
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("must not carry a walk checkpoint")));
+    }
+
+    #[test]
+    fn failed_run_may_keep_its_checkpoint_for_resume() {
+        let mut run = minimal_run();
+        run.status = RunStatus::Failed;
+        run.completed_at = Some("2026-01-01T00:00:00Z".to_string());
+        run.checkpoint = Some(RunCheckpoint {
+            phase: "per_file_analysis".to_string(),
+            next_file_index: 3,
+            files_scanned: 3,
+            files_skipped: 0,
+            saved_at: "2026-01-01T00:00:00Z".to_string(),
+            bytes_remaining: 4096,
+            matches_remaining: None,
+        });
+        assert!(validate_run(&run).is_empty(), "{:?}", validate_run(&run));
+    }
+
+    #[test]
+    fn resumed_info_rules() {
+        let mut run = minimal_run();
+        run.resumed = Some(ResumedInfo {
+            attempts: 1,
+            from_checkpoint: 2,
+            previous_status: "lost power".to_string(),
+        });
+        let problems = validate_run(&run);
+        assert!(problems.iter().any(|p| p.contains("at least 2 passes")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("not a known run status")));
     }
 
     #[test]

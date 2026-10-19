@@ -87,7 +87,7 @@ fn structured(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn server_exposes_seven_tools_with_schemas() {
+async fn server_exposes_eight_tools_with_schemas() {
     let (service, _home) = service_for_tests();
     let (client, server_handle) = spawn_server(service).await;
 
@@ -106,13 +106,14 @@ async fn server_exposes_seven_tools_with_schemas() {
         "vortex_list_runs",
         "vortex_read_evidence",
         "vortex_compare_runs",
+        "vortex_resume_run",
     ] {
         assert!(
             names.contains(&expected.to_string()),
             "missing tool {expected}: {names:?}"
         );
     }
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 8);
 
     // Input schemas exist and declare required fields.
     let inspect = tools

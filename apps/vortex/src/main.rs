@@ -15,6 +15,7 @@ use vortex_app::cli::{Cli, Command, EvidenceCommand, McpCommand, RunsCommand};
 use vortex_app::render;
 use vortex_core::config::VortexConfig;
 use vortex_core::error::{ErrorCode, VortexError};
+use vortex_evidence::store::RunStore;
 use vortex_evidence::RunStatus;
 use vortex_providers::provider::CancelToken;
 use vortex_service::service::{EvidenceSection, OperationOptions, VortexService};
@@ -41,6 +42,7 @@ async fn serve_mcp() -> ExitCode {
     let config = VortexConfig::from_env();
     match VortexService::new(config) {
         Ok(service) => {
+            report_startup_recovery(&service);
             let service = Arc::new(service);
             match vortex_app::mcp::serve_stdio(service).await {
                 Ok(()) => ExitCode::SUCCESS,
@@ -59,13 +61,41 @@ async fn serve_mcp() -> ExitCode {
 
 fn build_service() -> Result<Arc<VortexService>, VortexError> {
     let config = VortexConfig::from_env();
-    VortexService::new(config).map(Arc::new).map_err(|err| {
+    let service = VortexService::new(config).map(Arc::new).map_err(|err| {
         VortexError::new(
             ErrorCode::Storage,
             format!("cannot open the evidence store: {err}"),
         )
         .with_hint("set VORTEX_HOME to a writable directory and retry")
-    })
+    })?;
+    report_startup_recovery(&service);
+    Ok(service)
+}
+
+/// Tell the user what automatic crash recovery did at startup — the
+/// "recovers cleanly on next start with an explanation" acceptance.
+fn report_startup_recovery(service: &VortexService) {
+    let report = service.startup_recovery();
+    for entry in &report.recovered {
+        eprintln!(
+            "[vortex] recovered an interrupted run from a previous session: {}{}",
+            entry.run_id,
+            if entry.resumable {
+                " (resumable: 'vortex runs resume')"
+            } else {
+                ""
+            }
+        );
+    }
+    for left in &report.left_running {
+        eprintln!(
+            "[vortex] note: run {} is still 'running': {}",
+            left.run_id, left.reason
+        );
+    }
+    for problem in &report.errors {
+        eprintln!("[vortex] warning: {problem}");
+    }
 }
 
 async fn run_command(command: Command) -> ExitCode {
@@ -202,20 +232,59 @@ async fn run_command(command: Command) -> ExitCode {
                 json,
                 older_than_secs,
             } => match service.recover_stale_runs(Duration::from_secs(older_than_secs)) {
-                Ok(recovered) => {
+                Ok(report) => {
                     if json {
                         print_json(&serde_json::json!({
-                            "recovered": recovered,
-                            "count": recovered.len(),
+                            "recovered": report.recovered,
+                            "left_running": report.left_running,
+                            "errors": report.errors,
+                            "count": report.recovered.len(),
                             "older_than_secs": older_than_secs,
                         }));
                     } else {
-                        println!("{}", render::render_recovered(&recovered, older_than_secs));
+                        println!("{}", render::render_recovered(&report, older_than_secs));
                     }
                     ExitCode::SUCCESS
                 }
                 Err(err) => error_exit(err, json),
             },
+            RunsCommand::Resume {
+                run_id,
+                json,
+                timeout_secs,
+            } => {
+                let options = OperationOptions {
+                    invocation: format!("vortex runs resume {run_id}"),
+                    timeout_secs,
+                    ..OperationOptions::default()
+                };
+                let result = resume_with_ctrl_c(service.clone(), &run_id, &options).await;
+                match result {
+                    Ok(operation) => {
+                        // The stored record carries the resume detail.
+                        let detail = operation
+                            .run_id
+                            .as_deref()
+                            .and_then(|id| service.store().load(id).ok())
+                            .and_then(|run| run.status_detail);
+                        if json {
+                            print_json(&serde_json::to_value(&operation).unwrap_or_default());
+                        } else {
+                            let underlying = if operation.report.summary.get("query").is_some() {
+                                "search"
+                            } else {
+                                "inspect"
+                            };
+                            println!(
+                                "{}",
+                                render::render_resume(underlying, &operation, detail.as_deref())
+                            );
+                        }
+                        status_exit(operation.status)
+                    }
+                    Err(err) => error_exit(err, json),
+                }
+            }
         },
         Command::Evidence { command } => match command {
             EvidenceCommand::Show {
@@ -326,6 +395,49 @@ async fn analyze_with_ctrl_c(
         ))
         .with_hint(
             "this looks like a bug; please report it with the command you ran and the target",
+        )),
+    };
+    watcher.abort();
+    if let Ok(operation) = &result {
+        eprintln!(
+            "[vortex] done: {} findings, {} relationships (status: {})",
+            operation.report.findings.len(),
+            operation.report.relationships.len(),
+            operation.status.as_str()
+        );
+    }
+    result
+}
+
+/// Run `runs resume` with Ctrl-C wired to cooperative cancellation.
+async fn resume_with_ctrl_c(
+    service: Arc<VortexService>,
+    run_id: &str,
+    options: &OperationOptions,
+) -> Result<vortex_service::service::OperationResult, VortexError> {
+    eprintln!("[vortex] resuming run {run_id} ...");
+    let cancel = CancelToken::new();
+    let watcher_cancel = cancel.clone();
+    let watcher = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("[vortex] cancellation requested; stopping at the next checkpoint");
+            watcher_cancel.cancel();
+        }
+    });
+
+    let service_handle = service.clone();
+    let run_id = run_id.to_string();
+    let options = options.clone();
+    let task =
+        tokio::task::spawn_blocking(move || service_handle.resume_run(&run_id, &options, &cancel));
+
+    let result = match task.await {
+        Ok(result) => result,
+        Err(join_err) => Err(VortexError::internal(format!(
+            "resume task failed abnormally: {join_err}"
+        ))
+        .with_hint(
+            "this looks like a bug; please report it with the run id and the original command",
         )),
     };
     watcher.abort();

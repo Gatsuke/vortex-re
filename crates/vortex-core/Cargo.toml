@@ -12,3 +12,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
+
+# Process-liveness probes for crash recovery (kill(pid, 0)). Pure syscall
+# shim, no runtime engine; Unix-only because the probe is a Unix concept.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

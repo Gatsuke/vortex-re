@@ -34,6 +34,14 @@ pub const BUILTIN_STATIC_ID: &str = "builtin-static";
 /// Cap on manifests parsed per run (they are rare; the cap is a safety net).
 const MAX_MANIFESTS: usize = 20;
 
+/// Analyzed-file count between durable checkpoints. 25 keeps the worst
+/// case cheap (a re-analysis of ≤24 files after a crash) while making the
+/// extra write traffic negligible on multi-thousand-file runs.
+const CHECKPOINT_EVERY: usize = 25;
+
+/// Checkpoint phase label for the per-file analysis loops.
+const PHASE_PER_FILE: &str = "per_file_analysis";
+
 /// The offline built-in provider.
 #[derive(Debug, Clone)]
 pub struct BuiltinStaticProvider {
@@ -130,10 +138,17 @@ struct OpContext<'a> {
 
 impl<'a> OpContext<'a> {
     fn new(request: &'a AnalysisRequest) -> Self {
+        // A resumed pass continues with the earlier pass's remaining budget
+        // instead of a fresh one — budgets are per run, not per pass.
+        let budget = request
+            .resume
+            .as_ref()
+            .map(|resume| resume.bytes_remaining)
+            .unwrap_or(request.limits.max_total_bytes);
         Self {
             request,
             root: &request.root,
-            budget: request.limits.max_total_bytes,
+            budget,
         }
     }
 
@@ -144,6 +159,74 @@ impl<'a> OpContext<'a> {
     fn stop(&self) -> Option<StopReason> {
         self.request.stop_reason()
     }
+
+    /// Where this pass continues from (0 for fresh runs).
+    fn resume_from(&self) -> usize {
+        self.request
+            .resume
+            .as_ref()
+            .map(|r| r.from_index)
+            .unwrap_or(0)
+    }
+
+    fn prior_scanned(&self) -> usize {
+        self.request
+            .resume
+            .as_ref()
+            .map(|r| r.prior_files_scanned)
+            .unwrap_or(0)
+    }
+
+    fn prior_skipped(&self) -> usize {
+        self.request
+            .resume
+            .as_ref()
+            .map(|r| r.prior_files_skipped)
+            .unwrap_or(0)
+    }
+}
+
+/// Emit a durable checkpoint at `per_file_analysis` boundaries.
+///
+/// Called at the top of each loop iteration with `analyzed` = files completed
+/// in this pass so far and `next_index` = the walk index about to be worked
+/// on. Emissions are suppressed once a stop condition is observed — a
+/// checkpoint is never written after cancellation (the commit rule).
+fn maybe_checkpoint(
+    ctx: &OpContext,
+    builder: &ReportBuilder,
+    analyzed: usize,
+    next_index: usize,
+    matches_remaining: Option<usize>,
+) {
+    let Some(sink) = &ctx.request.checkpoint_sink else {
+        return;
+    };
+    if analyzed == 0 || !analyzed.is_multiple_of(CHECKPOINT_EVERY) {
+        return;
+    }
+    if ctx.stop().is_some() {
+        return; // cancelled or timed out at this boundary: no commit happens
+    }
+    let checkpoint = vortex_evidence::RunCheckpoint {
+        phase: PHASE_PER_FILE.to_string(),
+        next_file_index: next_index,
+        files_scanned: ctx.prior_scanned() + builder.scanned_count(),
+        files_skipped: ctx.prior_skipped() + builder.skipped_count(),
+        saved_at: vortex_core::timeutil::now_rfc3339(),
+        bytes_remaining: ctx.budget,
+        matches_remaining: matches_remaining.map(|m| m as u64),
+    };
+    sink(&checkpoint, &builder.progress_snapshot());
+}
+
+/// Id offsets for a resumed pass (0 for fresh runs).
+fn offsets_of(request: &AnalysisRequest) -> (usize, usize) {
+    request
+        .resume
+        .as_ref()
+        .map(|resume| (resume.finding_offset, resume.relationship_offset))
+        .unwrap_or((0, 0))
 }
 
 impl AnalysisProvider for BuiltinStaticProvider {
@@ -159,7 +242,12 @@ impl AnalysisProvider for BuiltinStaticProvider {
 
     fn inspect(&self, request: &AnalysisRequest) -> ProviderReport {
         let mut ctx = OpContext::new(request);
-        let mut builder = ReportBuilder::new(request.limits.clone());
+        let (finding_offset, relationship_offset) = offsets_of(request);
+        let mut builder = ReportBuilder::new_with_offsets(
+            request.limits.clone(),
+            finding_offset,
+            relationship_offset,
+        );
         let summary = match request.target.kind {
             vortex_core::paths::TargetKind::File => inspect_file(&mut ctx, &mut builder),
             vortex_core::paths::TargetKind::Directory => inspect_directory(&mut ctx, &mut builder),
@@ -170,7 +258,12 @@ impl AnalysisProvider for BuiltinStaticProvider {
 
     fn search(&self, request: &AnalysisRequest, query: &SearchQuery) -> ProviderReport {
         let mut ctx = OpContext::new(request);
-        let mut builder = ReportBuilder::new(request.limits.clone());
+        let (finding_offset, relationship_offset) = offsets_of(request);
+        let mut builder = ReportBuilder::new_with_offsets(
+            request.limits.clone(),
+            finding_offset,
+            relationship_offset,
+        );
         if query.text.is_empty() {
             builder.error(
                 "validation",
@@ -193,7 +286,18 @@ impl AnalysisProvider for BuiltinStaticProvider {
 
     fn relationships(&self, request: &AnalysisRequest) -> ProviderReport {
         let mut ctx = OpContext::new(request);
-        let mut builder = ReportBuilder::new(request.limits.clone());
+        let (finding_offset, relationship_offset) = offsets_of(request);
+        let mut builder = ReportBuilder::new_with_offsets(
+            request.limits.clone(),
+            finding_offset,
+            relationship_offset,
+        );
+        if request.checkpoint_sink.is_some() || request.resume.is_some() {
+            builder.limitation(
+                "checkpoints and resume are not supported for relationship analysis in this \
+                 release; the request was processed without them",
+            );
+        }
         let summary = relationships_impl(&mut ctx, &mut builder);
         let stop = ctx.stop();
         builder.finish(summary, stop)
@@ -518,12 +622,30 @@ fn inspect_directory(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde_
     let mut by_extension: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_format: BTreeMap<String, usize> = BTreeMap::new();
     let mut hashed: Vec<(String, String)> = Vec::new();
-    let mut manifest_reports = 0usize;
+    // Cross-pass counters: caps like MAX_MANIFESTS and max_entries limit the
+    // *run*, so a resumed pass starts from what earlier passes consumed.
+    let mut manifest_reports = ctx
+        .request
+        .resume
+        .as_ref()
+        .map(|resume| resume.manifests_parsed)
+        .unwrap_or(0);
     let mut entry_point: Option<(String, String)> = None; // (manifest rel, entry rel)
     let mut electron = false;
-    let mut sourcemap_refs = 0usize;
+    let mut sourcemap_refs = ctx
+        .request
+        .resume
+        .as_ref()
+        .map(|resume| resume.entries_used)
+        .unwrap_or(0);
 
-    for entry in &walk_result.files {
+    for (index, entry) in walk_result.files.iter().enumerate() {
+        // Files analyzed in an earlier pass are skipped entirely.
+        if index < ctx.resume_from() {
+            continue;
+        }
+        // Durable checkpoint at `per_file_analysis` boundaries.
+        maybe_checkpoint(ctx, builder, index - ctx.resume_from(), index, None);
         if let Some(StopReason::Deadline | StopReason::Cancelled) = ctx.stop() {
             break;
         }
@@ -916,9 +1038,28 @@ fn search_directory(
     let mut files_searched = 0usize;
     let mut files_skipped_binary = 0usize;
     let mut truncated_by_global = false;
-    let mut remaining_matches = ctx.limits().max_matches;
+    // A resumed pass continues with the earlier pass's remaining match budget.
+    let mut remaining_matches = ctx
+        .request
+        .resume
+        .as_ref()
+        .map(|resume| resume.matches_remaining)
+        .unwrap_or(ctx.limits().max_matches);
 
-    for entry in &walk_result.files {
+    for (index, entry) in walk_result.files.iter().enumerate() {
+        // Files searched in an earlier pass are skipped entirely.
+        if index < ctx.resume_from() {
+            continue;
+        }
+        // Durable checkpoint at `per_file_analysis` boundaries (search cap
+        // travels with the checkpoint so resume cannot exceed the total).
+        maybe_checkpoint(
+            ctx,
+            builder,
+            index - ctx.resume_from(),
+            index,
+            Some(remaining_matches),
+        );
         if remaining_matches == 0 {
             truncated_by_global = true;
             builder.limitation(format!(
@@ -1624,7 +1765,7 @@ fn classify_resolved(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{AnalysisRequest, CancelToken, Outcome};
+    use crate::provider::{AnalysisRequest, CancelToken, Outcome, ResumeContext};
     use std::time::Instant;
     use vortex_core::limits::ResourceLimits;
     use vortex_core::paths::{validate_target, TargetKind};
@@ -1642,6 +1783,8 @@ mod tests {
             limits,
             deadline: None,
             cancel: CancelToken::new(),
+            checkpoint_sink: None,
+            resume: None,
         }
     }
 
@@ -1951,5 +2094,109 @@ mod tests {
         assert!(report.warnings.iter().any(|w| w.contains("not valid JSON")));
         // The run still succeeded overall: the problem is recorded, not fatal.
         assert_eq!(report.outcome, Outcome::Succeeded);
+    }
+    /// Checkpoints fire at every CHECKPOINT_EVERY boundary with the walk
+    /// index of the next file, and carry honest cross-pass counters.
+    #[test]
+    fn checkpoints_fire_at_boundaries_with_correct_indices() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().join("tree");
+        std::fs::create_dir_all(&base).unwrap();
+        for i in 0..60 {
+            std::fs::write(
+                base.join(format!("f{i:02}.js")),
+                format!("require('./x.js');\n//# sourceMappingURL=f{i:02}.map\n"),
+            )
+            .unwrap();
+        }
+        let mut request = request_for(&base, ResourceLimits::default());
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = events.clone();
+        request.checkpoint_sink = Some(std::sync::Arc::new(move |cp, snapshot| {
+            sink_events
+                .lock()
+                .unwrap()
+                .push((cp.clone(), snapshot.clone()));
+        }));
+        let provider = BuiltinStaticProvider::new();
+        let report = provider.inspect(&request);
+        assert_eq!(report.outcome, Outcome::Succeeded);
+
+        let events = events.lock().unwrap();
+        let indices: Vec<usize> = events.iter().map(|(cp, _)| cp.next_file_index).collect();
+        // 60 files, one checkpoint every 25 analyzed: boundaries at 25 and 50.
+        assert_eq!(indices, vec![25, 50], "checkpoint boundaries");
+        for (cp, snapshot) in events.iter() {
+            assert_eq!(cp.phase, "per_file_analysis");
+            // The snapshot carries exactly the findings produced so far.
+            assert_eq!(snapshot.findings.len(), cp.files_scanned);
+        }
+        assert_eq!(events[0].0.files_scanned, 25);
+        assert_eq!(events[0].0.next_file_index, 25);
+    }
+
+    /// A resumed pass skips the first `from_index` files, keeps ids unique,
+    /// and honors run-wide caps across passes.
+    #[test]
+    fn resumed_pass_skips_completed_files_and_continues_ids() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().join("tree");
+        std::fs::create_dir_all(&base).unwrap();
+        for i in 0..60 {
+            std::fs::write(
+                base.join(format!("f{i:02}.js")),
+                format!("require('./x.js');\n//# sourceMappingURL=f{i:02}.map\n"),
+            )
+            .unwrap();
+        }
+        let mut request = request_for(&base, ResourceLimits::default());
+        request.resume = Some(ResumeContext {
+            from_index: 25,
+            finding_offset: 25,
+            relationship_offset: 0,
+            matches_remaining: 100,
+            bytes_remaining: ResourceLimits::default().max_total_bytes,
+            prior_files_scanned: 25,
+            prior_files_skipped: 0,
+            entries_used: 25,
+            manifests_parsed: 0,
+        });
+        let provider = BuiltinStaticProvider::new();
+        let report = provider.inspect(&request);
+        assert_eq!(report.outcome, Outcome::Succeeded);
+
+        // The earlier pass consumed 25 of the 50 run-wide reference entries,
+        // so this pass may record at most 25 more (files f25..f49).
+        assert_eq!(
+            report.findings.len(),
+            25,
+            "run-wide max_entries cap honored across passes"
+        );
+        assert_eq!(report.counts.files_scanned, 35);
+        // Ids continue after the earlier pass's findings.
+        assert_eq!(report.findings.first().unwrap().id, "f26");
+        // The first analyzed file is index 25, never an earlier one.
+        let first_file = report.findings[0]
+            .location
+            .as_ref()
+            .and_then(|l| l.file.clone())
+            .unwrap_or_default();
+        assert!(
+            first_file.starts_with("f25"),
+            "first analyzed file: {first_file}"
+        );
+        // The last file analyzed is the last in walk order.
+        let last_file = report
+            .findings
+            .last()
+            .unwrap()
+            .location
+            .as_ref()
+            .and_then(|l| l.file.clone())
+            .unwrap_or_default();
+        assert!(
+            last_file.starts_with("f49"),
+            "last analyzed file: {last_file}"
+        );
     }
 }

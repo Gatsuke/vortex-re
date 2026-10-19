@@ -9,6 +9,7 @@ pub mod digest;
 pub mod error;
 pub mod limits;
 pub mod paths;
+pub mod process;
 pub mod redact;
 pub mod timeutil;
 

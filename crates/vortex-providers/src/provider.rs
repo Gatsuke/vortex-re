@@ -122,8 +122,69 @@ pub enum StopReason {
     Deadline,
 }
 
-/// A validated analysis request with limits and stop conditions.
+/// Resume context for operations continued from a checkpoint.
+///
+/// Providers must skip walk entries before `from_index`, start their
+/// builders' id counters at the offsets (so ids stay unique across passes),
+/// and initialize budgets from the remaining values instead of the limits.
 #[derive(Debug, Clone)]
+pub struct ResumeContext {
+    /// Walk index to continue from; entries before it were analyzed in an
+    /// earlier pass and must not be re-analyzed.
+    pub from_index: usize,
+    /// Finding-id offset: existing findings occupy `f1..=f{finding_offset}`.
+    pub finding_offset: usize,
+    /// Relationship-id offset: existing relationships occupy
+    /// `r1..=r{relationship_offset}`.
+    pub relationship_offset: usize,
+    /// Search-only: matches still allowed under the recorded cap.
+    pub matches_remaining: usize,
+    /// Byte budget left from the earlier pass.
+    pub bytes_remaining: u64,
+    /// Files fully analyzed in earlier passes (for honest cross-pass counts).
+    pub prior_files_scanned: usize,
+    /// Files skipped in earlier passes.
+    pub prior_files_skipped: usize,
+    /// Summary-entry budget already consumed in earlier passes (used by caps
+    /// that count per run, like source-map references).
+    pub entries_used: usize,
+    /// Manifests already parsed in earlier passes (MAX_MANIFESTS is per run).
+    pub manifests_parsed: usize,
+}
+
+/// A mid-run progress snapshot, handed to the checkpoint sink alongside the
+/// checkpoint so the durable record carries findings produced so far.
+#[derive(Debug, Clone)]
+pub struct ProgressSnapshot {
+    /// Findings produced by the current pass.
+    pub findings: Vec<Finding>,
+    /// Relationships produced by the current pass.
+    pub relationships: Vec<Relationship>,
+    /// Limitations recorded so far.
+    pub limitations: Vec<String>,
+    /// Unknowns recorded so far.
+    pub unknowns: Vec<String>,
+    /// Warnings recorded so far.
+    pub warnings: Vec<String>,
+    /// Structured errors recorded so far.
+    pub errors: Vec<ErrorRecord>,
+    /// Redactions recorded so far.
+    pub redactions: Vec<RedactionRecord>,
+    /// Files fully analyzed in the current pass.
+    pub files_scanned: usize,
+    /// Files skipped in the current pass.
+    pub files_skipped: usize,
+}
+
+/// Sink type for durable checkpoints, invoked by providers at safe
+/// boundaries. Never called after cancellation was observed.
+pub type CheckpointSink =
+    Arc<dyn Fn(&vortex_evidence::RunCheckpoint, &ProgressSnapshot) + Send + Sync>;
+
+/// A validated analysis request with limits and stop conditions.
+///
+/// Not `Debug`: the optional checkpoint sink is an opaque closure.
+#[derive(Clone)]
 pub struct AnalysisRequest {
     /// Validated target information.
     pub target: TargetInfo,
@@ -136,6 +197,11 @@ pub struct AnalysisRequest {
     pub deadline: Option<Instant>,
     /// Cooperative cancellation token.
     pub cancel: CancelToken,
+    /// Optional durable-checkpoint sink (long directory runs).
+    #[allow(clippy::type_complexity)]
+    pub checkpoint_sink: Option<CheckpointSink>,
+    /// Optional resume position from an earlier pass.
+    pub resume: Option<ResumeContext>,
 }
 
 impl AnalysisRequest {
@@ -154,7 +220,7 @@ impl AnalysisRequest {
 }
 
 /// Search parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchQuery {
     /// Literal text to find (never a regex).
     pub text: String,
@@ -216,6 +282,8 @@ pub struct ReportBuilder {
     findings_truncated: bool,
     relationships_truncated: bool,
     partial_forced: Option<String>,
+    finding_allowance: usize,
+    relationship_allowance: usize,
     next_finding: usize,
     next_relationship: usize,
     files_scanned: usize,
@@ -223,9 +291,25 @@ pub struct ReportBuilder {
 }
 
 impl ReportBuilder {
-    /// Create a builder with the given limits.
+    /// Create a builder with the given limits and fresh id counters.
     pub fn new(limits: ResourceLimits) -> Self {
+        Self::new_with_offsets(limits, 0, 0)
+    }
+
+    /// Create a builder continuing after existing findings/relationships
+    /// (used by resumed runs so ids stay unique across passes).
+    ///
+    /// The per-run caps shrink by the prior passes' usage: `max_findings` and
+    /// `max_relationships` limit the *whole run*, so a resumed pass only gets
+    /// whatever allowance is left.
+    pub fn new_with_offsets(
+        limits: ResourceLimits,
+        finding_offset: usize,
+        relationship_offset: usize,
+    ) -> Self {
         Self {
+            finding_allowance: limits.max_findings.saturating_sub(finding_offset),
+            relationship_allowance: limits.max_relationships.saturating_sub(relationship_offset),
             limits,
             findings: Vec::new(),
             relationships: Vec::new(),
@@ -237,8 +321,8 @@ impl ReportBuilder {
             findings_truncated: false,
             relationships_truncated: false,
             partial_forced: None,
-            next_finding: 0,
-            next_relationship: 0,
+            next_finding: finding_offset,
+            next_relationship: relationship_offset,
             files_scanned: 0,
             files_skipped: 0,
         }
@@ -254,7 +338,7 @@ impl ReportBuilder {
         artifact: Option<ArtifactRef>,
         details: serde_json::Value,
     ) -> Option<String> {
-        if self.findings.len() >= self.limits.max_findings {
+        if self.findings.len() >= self.finding_allowance {
             self.findings_truncated = true;
             return None;
         }
@@ -286,7 +370,7 @@ impl ReportBuilder {
         evidence_finding_id: Option<String>,
         location: Option<Location>,
     ) -> Option<String> {
-        if self.relationships.len() >= self.limits.max_relationships {
+        if self.relationships.len() >= self.relationship_allowance {
             self.relationships_truncated = true;
             return None;
         }
@@ -403,6 +487,21 @@ impl ReportBuilder {
     /// Read-only view of findings collected so far.
     pub fn findings_snapshot(&self) -> &[Finding] {
         &self.findings
+    }
+
+    /// Full progress snapshot for a durable checkpoint (clones content).
+    pub fn progress_snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            findings: self.findings.clone(),
+            relationships: self.relationships.clone(),
+            limitations: self.limitations.clone(),
+            unknowns: self.unknowns.clone(),
+            warnings: self.warnings.clone(),
+            errors: self.errors.clone(),
+            redactions: self.redactions.clone(),
+            files_scanned: self.files_scanned,
+            files_skipped: self.files_skipped,
+        }
     }
 
     /// Turn the accumulated state into a report with a recommended outcome.
@@ -567,9 +666,48 @@ mod tests {
             limits: ResourceLimits::default(),
             deadline: Some(Instant::now() - std::time::Duration::from_secs(1)),
             cancel: CancelToken::new(),
+            checkpoint_sink: None,
+            resume: None,
         };
         assert_eq!(request.stop_reason(), Some(StopReason::Deadline));
         request.cancel.cancel();
         assert_eq!(request.stop_reason(), Some(StopReason::Cancelled));
+    }
+
+    #[test]
+    fn builder_offsets_continue_ids_without_collisions() {
+        let limits = ResourceLimits::default();
+        let mut builder = ReportBuilder::new_with_offsets(limits, 3, 1);
+        let f = builder
+            .finding(
+                "file",
+                Origin::Observed,
+                "fourth".into(),
+                None,
+                None,
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(f, "f4", "ids continue after the offset");
+        let r = builder
+            .relationship(
+                vortex_evidence::Node {
+                    kind: "file".into(),
+                    id: "a".into(),
+                },
+                vortex_evidence::Node {
+                    kind: "file".into(),
+                    id: "b".into(),
+                },
+                "imports",
+                vortex_evidence::Scope::Internal,
+                vortex_evidence::Resolution::Resolved,
+                None,
+                Origin::Observed,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(r, "r2");
     }
 }
