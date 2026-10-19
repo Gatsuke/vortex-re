@@ -994,6 +994,15 @@ impl SinkHandle {
 /// Progress-observer hook type for checkpoint events.
 pub type CheckpointHook = Option<Arc<dyn Fn(&RunCheckpoint) + Send + Sync>>;
 
+/// The one and only error for an unparseable evidence section name — shared
+/// by the CLI and MCP so the surfaces cannot drift (the parity contract).
+pub fn unknown_section_error(section: &str) -> VortexError {
+    VortexError::validation(format!("unknown evidence section '{section}'")).with_hint(
+        "valid sections: overview, summary, findings, relationships, limitations, \
+         unknowns, warnings, errors",
+    )
+}
+
 /// Caller parameters that can change findings, recorded on every new run.
 fn operation_params_of(query_text: Option<&str>, options: &OperationOptions) -> OperationParams {
     OperationParams {

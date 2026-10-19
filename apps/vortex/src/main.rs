@@ -295,13 +295,10 @@ async fn run_command(command: Command) -> ExitCode {
                 page_size,
             } => {
                 let Some(section) = EvidenceSection::parse(&section) else {
-                    let err =
-                        VortexError::validation(format!("unknown evidence section '{section}'"))
-                            .with_hint(
-                                "valid sections: overview, summary, findings, relationships, \
-                         limitations, unknowns, warnings, errors",
-                            );
-                    return error_exit(err, json);
+                    return error_exit(
+                        vortex_service::service::unknown_section_error(&section),
+                        json,
+                    );
                 };
                 match service.read_evidence(&run_id, section, page, page_size) {
                     Ok(view) => {

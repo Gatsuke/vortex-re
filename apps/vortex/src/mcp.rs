@@ -407,14 +407,9 @@ impl VortexServer {
             .clone()
             .unwrap_or_else(|| "overview".to_string());
         let Some(section) = EvidenceSection::parse(&section_name) else {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                serde_json::json!({
-                    "code": "validation",
-                    "message": format!("unknown section '{section_name}'"),
-                    "hint": "valid sections: overview, summary, findings, relationships, limitations, unknowns, warnings, errors",
-                })
-                .to_string(),
-            )]));
+            return Ok(tool_error(&vortex_service::service::unknown_section_error(
+                &section_name,
+            )));
         };
         let run_id = params.run_id.clone();
         let page = params.page.unwrap_or(1).max(1);

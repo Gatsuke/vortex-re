@@ -191,6 +191,132 @@ pub fn run_doctor(service: &VortexService) -> DoctorReport {
         }),
     }
 
+    // Startup recovery: what automatic crash recovery did when this service
+    // instance was created. This is the "recovers cleanly with an
+    // explanation" acceptance made inspectable.
+    {
+        let recovery = service.startup_recovery();
+        let status = if recovery.errors.is_empty() {
+            if recovery.recovered.is_empty() {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Warn
+            }
+        } else {
+            CheckStatus::Fail
+        };
+        checks.push(CheckResult {
+            name: "startup_recovery".to_string(),
+            status,
+            detail: format!(
+                "{} run(s) recovered as failed, {} left as 'running', {} persistence problem(s)",
+                recovery.recovered.len(),
+                recovery.left_running.len(),
+                recovery.errors.len()
+            ),
+            hint: if recovery.recovered.is_empty() && recovery.errors.is_empty() {
+                None
+            } else {
+                Some(
+                    "recovered runs explain themselves in their status_detail; resumable ones \
+                     point at 'vortex runs resume'"
+                        .to_string(),
+                )
+            },
+        });
+        for entry in &recovery.recovered {
+            checks.push(CheckResult {
+                name: format!("recovered_run:{}", entry.run_id),
+                status: CheckStatus::Warn,
+                detail: entry.reason.clone(),
+                hint: Some(if entry.resumable {
+                    "run 'vortex runs resume <run-id>' to continue from the checkpoint".to_string()
+                } else {
+                    "re-run the operation; nothing durable was saved mid-run".to_string()
+                }),
+            });
+        }
+    }
+
+    // Schema versions across the store: older records load tolerantly (with
+    // an explicit note); newer ones cannot be read at all.
+    {
+        let store = service.store();
+        let mut older = 0usize;
+        let mut current = 0usize;
+        let mut newer: Vec<String> = Vec::new();
+        // The store's public trait does not expose per-record schema
+        // versions; read them straight from the store directory (the same
+        // JSON the store itself would parse).
+        let location = store.location();
+        if let Ok(entries) = std::fs::read_dir(&location) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(body) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+                    continue;
+                };
+                match value.get("schema_version").and_then(|v| v.as_u64()) {
+                    Some(version) if version < u64::from(vortex_evidence::SCHEMA_VERSION) => {
+                        older += 1;
+                    }
+                    Some(version) if version > u64::from(vortex_evidence::SCHEMA_VERSION) => {
+                        let id = value
+                            .get("run_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<unknown>")
+                            .to_string();
+                        newer.push(id);
+                    }
+                    Some(_) => current += 1,
+                    None => continue,
+                }
+            }
+        }
+        let status = if newer.is_empty() {
+            if older == 0 {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Warn
+            }
+        } else {
+            CheckStatus::Fail
+        };
+        checks.push(CheckResult {
+            name: "schema_versions".to_string(),
+            status,
+            detail: format!(
+                "{} record(s) at the current schema (v{}), {} older record(s) loaded tolerantly, \
+                 {} newer than this tool",
+                current,
+                vortex_evidence::SCHEMA_VERSION,
+                older,
+                newer.len()
+            ),
+            hint: if newer.is_empty() {
+                if older > 0 {
+                    Some(
+                        "older records are readable but carry no owner/checkpoint; they cannot be \
+                         resumed — re-run instead"
+                            .to_string(),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                Some(format!(
+                    "records written by a newer vortex exist ({}) — upgrade this binary to read them",
+                    newer.join(", ")
+                ))
+            },
+        });
+    }
+
     // Providers.
     let capabilities = service.capabilities();
     for provider in &capabilities.providers {
