@@ -122,12 +122,33 @@ client accordingly.
 
 **Mitigations**: records carry the artifact digest and provider/tool
 versions, and `vortex evidence export` output can be re-validated with the
-same schema rules. Run files are written atomically.
+same schema rules. Run files are written atomically. For tamper evidence,
+`evidence export --signed` produces an Ed25519 signature sidecar
+verifiable by any third party holding the exporter's public key
+(`evidence verify`), and every signed export appends to a hash-chained,
+append-only ledger (`exports-ledger.jsonl`) whose `doctor` check reports
+the chain's health.
 
 **Residual risk**: the store is plain JSON on local disk with local file
-permissions — anyone with write access to the data directory can edit it.
-The tool is not a notary; if you need tamper evidence, sign exports with
-an external tool.
+permissions — anyone with write access to the data directory can edit
+unsigned records. The ledger detects modification and reordering of past
+entries, but **not** truncation of the ledger's tail, and a compromised
+signing key can sign anything. The tool is not a notary; if an adversary
+controls the machine, use an external signature made off-box.
+
+### 7. Config-file policy weakening
+
+**Threat**: a writable config file is used to weaken safety posture
+silently (for example, loosening limits so an agent can hammer a target,
+or repointing storage).
+
+**Mitigations**: the config file can only tune resource limits,
+per-provider timeouts, and recovery grace — it cannot set `VORTEX_HOME` or
+`VORTEX_ALLOWED_ROOTS`, which are environment-only by design. A file that
+could weaken a policy is a policy downgrade vector. Unknown keys and
+sections are rejected by name (all at once), so a typo cannot silently
+disable a limit. The effective limits of every run are recorded inside the
+run itself, and `doctor` reports which config file was applied.
 
 ## Explicit non-goals
 

@@ -4,7 +4,7 @@ Phases are ordered deliberately: each one makes the next safer. Nothing on
 this page is available until it ships with tests, and `vortex doctor` is
 the source of truth for what works in any given release.
 
-## Phase One — working MVP (this release)
+## Phase One — working MVP (v0.1.0)
 
 **Goal**: a developer can inspect the bundled JavaScript/Electron fixture,
 search it, discover its relationships, retrieve durable evidence through
@@ -27,43 +27,57 @@ Acceptance criteria (all met; see README "Verifying this release"):
 - [x] CI runs fmt/check/clippy(-D warnings)/tests.
 - [x] Docs: architecture, threat model, evidence format, providers, MCP.
 
-Known initial limitations (documented, tracked below): manual crash
-recovery via `runs recover`; comments not stripped in JS scanning; no
-archive extraction.
+Known initial limitations (documented, tracked below): comments not
+stripped in JS scanning; no archive extraction. The original limitation
+"manual crash recovery via `runs recover`" was resolved in Phase Two
+(owner-aware automatic recovery; `runs recover` remains as the explicit
+override).
 
-## Phase Two — reliability
+## Phase Two — reliability (shipped)
 
 **Goal**: make durability and failure handling boring.
 
-- [ ] Automatic detection of stale `running` runs on startup (today:
-      `vortex runs recover` is manual).
-- [ ] Resumable runs for large artifacts (checkpoint the walk position).
-- [ ] MCP protocol-level cancellation mapped to run cancellation
+- [x] Automatic detection of stale `running` runs on startup, using the
+      recorded owner process to ask the OS whether it is still alive; the
+      grace period for undecidable cases is configurable
+      (`[recovery] grace_secs`), default one hour.
+- [x] Resumable runs for large artifacts: directory `inspect` and `search`
+      runs checkpoint the walk position; `vortex runs resume` continues
+      from the last durable checkpoint when the artifact is unchanged.
+- [x] MCP protocol-level cancellation mapped to run cancellation
       (application-level cancellation exists today). Cancellation rules from
       upstream research (docs/UPSTREAM_LESSONS.md, Lesson 3): check before
       every store commit; a cancelled run never emits `succeeded`; completed
       partial findings are retained and labeled `cancelled`.
-- [ ] CLI/MCP error-code parity tests: identical invalid input must produce
+- [x] CLI/MCP error-code parity tests: identical invalid input must produce
       the identical structured error through both surfaces.
-- [ ] Doctor hardening: malformed-input unit tests (truncated config,
-      garbage data), platform-filtered recovery hints.
-- [ ] Response-size budget test: a pathological fixture's MCP response stays
+- [x] Doctor hardening: malformed-input unit tests (truncated records,
+      garbage data, schema-version diagnostics), platform-filtered recovery
+      hints.
+- [x] Response-size budget test: a pathological fixture's MCP response stays
       under a fixed byte ceiling (bounded-output regression guard).
-- [ ] Adversarial artifact corpus in CI (giant single line, deep tree,
+- [x] Adversarial artifact corpus in CI (giant single line, deep tree,
       pathological package graph) — all must produce `partial`, never a
       crash (docs/UPSTREAM_LESSONS.md, Lesson 1).
-- [ ] Provider timeouts as first-class, per-provider configuration.
-- [ ] Signed/append-only evidence export option (tamper evidence).
-- [ ] Evidence-record identity stability policy: schema changes never
+- [x] Provider timeouts as first-class, per-provider configuration
+      (`[providers."<id>"] timeout_secs`).
+- [x] Signed/append-only evidence export option (tamper evidence):
+      Ed25519-signed exports with `evidence verify`, and a hash-chained
+      append-only export ledger.
+- [x] Evidence-record identity stability policy: schema changes never
       silently alter run IDs or digests; older records import with an
-      explicit `older_schema` note (upstream #4436 lesson).
+      explicit `older_schema` note (upstream #4436 lesson). Schema v2
+      loads v1 records unchanged.
 - [ ] SQLite-backed `RunStore` behind the existing trait if query needs
-      outgrow file scanning (not planned for its own sake).
-- [ ] Config file for persistent limit overrides (environment + flags today).
+      outgrow file scanning (deliberately not done for its own sake; the
+      trait keeps the door open).
+- [x] Config file for persistent limit overrides (`vortex-re/config.toml`
+      or `--config`): partial `[limits]`, per-provider timeouts, recovery
+      grace. Security-relevant settings stay environment-only.
 
-**Acceptance**: kill -9 during a run recovers cleanly on next start with an
-explanation; cancellation returns within one checkpoint; partial results
-never regress.
+**Acceptance** (met, verified by the test suite): kill -9 during a run
+recovers cleanly on next start with an explanation; cancellation returns
+within one checkpoint; partial results never regress.
 
 ## Phase Three — broader static analysis
 

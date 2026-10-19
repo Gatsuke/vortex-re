@@ -17,7 +17,9 @@ Implemented in `crates/vortex-providers/src/provider.rs`:
 | Structured results | Findings/relationships with origins and locations |
 | Errors and warnings | Recovered problems are in-band; fatal ones still preserve partial findings |
 | Resource limits | Enforce `ResourceLimits`; every cap hit is recorded and flips the outcome to `partial` |
+| Timeouts | The service applies the effective time budget (flag > config-file per-provider `timeout_secs` > default) and passes it in the request |
 | Cancellation | Check `stop_reason()` (deadline + cancel token) at safe checkpoints |
+| Checkpoints | Long directory runs call the checkpoint sink at safe boundaries so the durable record can be resumed (`vortex runs resume`) |
 | Determinism | Same input + limits → same output |
 
 Two hard rules from the project charter:

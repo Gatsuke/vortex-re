@@ -17,10 +17,13 @@
 ```
 vortex-re/
 ├── crates/
-│   ├── vortex-core/       # Shared vocabulary: errors, limits, config,
-│   │                      # digests, path validation, redaction, time.
-│   ├── vortex-evidence/   # Evidence model (schema v1), validation, the
-│   │                      # file-based run store, pagination, comparison.
+│   ├── vortex-core/       # Shared vocabulary: errors, limits, config +
+│   │                      # config file, digests, path validation, redaction,
+│   │                      # time, process identity, Ed25519 signing.
+│   ├── vortex-evidence/   # Evidence model (schema v2), validation, the
+│   │                      # file-based run store with checkpoints and
+│   │                      # owner-aware recovery, pagination, comparison,
+│   │                      # and the append-only export ledger.
 │   ├── vortex-providers/  # Provider abstraction + the built-in static
 │   │                      # analysis provider (identification, strings,
 │   │                      # JS/JSON/manifest scanning, search, walk).
@@ -57,10 +60,17 @@ crate would have made it untestable without the binary and temptingly easy
 to bypass from UI code. The service crate owns:
 
 * run lifecycle — a durable `running` record is persisted *before* analysis
-  starts, so crashed operations stay visible and recoverable;
+  starts (with owner process and, for directory runs, walk checkpoints),
+  so crashed operations stay visible, recoverable, and resumable;
 * provider dispatch — explicit, never silently substituting providers;
-* evidence retrieval with pagination, export, and comparison;
+* evidence retrieval with pagination, export (optionally signed),
+  comparison, and resume;
 * diagnostics (`doctor`).
+
+Configuration resolution (`VortexConfig::resolve`: environment + optional
+TOML config file + flags, in that precedence) lives in `vortex-core` and is
+invoked identically by both frontends — the MCP server accepts the same
+`--config` flag as the CLI.
 
 ## Run lifecycle
 
@@ -89,11 +99,18 @@ returns a status and an errors list, and partial findings are preserved in
 the stored record. Only infrastructure failures (invalid arguments, storage
 errors) surface as process/tool errors.
 
-**Crash recovery** (initial implementation): a run interrupted by a killed
-process stays `running` forever. `vortex runs recover` marks `running` runs
-older than the threshold (default 1 hour) as `failed` with an explicit note
-that runs are not resumable in this version. Automatic resumption is a
-Phase Two roadmap item, not a current claim.
+**Crash recovery** (Phase Two): the durable `running` record also carries
+its **owner process** (PID + start time, where the platform provides it).
+On the next start, `VortexService::new` asks the operating system whether
+each stranded run's owner is still alive: dead owners are marked `failed`
+with an explanation immediately; ambiguous cases (unknown platform,
+undecidable liveness) wait out a configurable grace period (default one
+hour, `[recovery] grace_secs`) or are handled explicitly by `vortex runs
+recover`. Long directory runs additionally write a durable **walk
+checkpoint** every file, so `vortex runs resume` re-walks, skips to the
+recorded index, and continues — reusing the recorded limits and refusing
+to resume if the artifact changed (digest mismatch). Recovery is idempotent:
+a recovered run is never recovered twice.
 
 ## The built-in provider (`builtin-static`)
 
@@ -123,7 +140,14 @@ The store is one JSON document per run under `<data_dir>/runs/`, written
 atomically (temp file + rename). The storage format **is** the export
 format, so exports are independently readable and validatable. The
 `RunStore` trait keeps the mechanism swappable — a SQLite-backed store is a
-documented Phase Two option, not a current claim.
+documented future option, not a current claim.
+
+Two more durable files live beside the runs: `<data_dir>/keys/` holds the
+Ed25519 signing keypair used by `evidence export --signed` (generated on
+first use, announced by `doctor`), and `<data_dir>/exports-ledger.jsonl`
+is the hash-chained, append-only ledger of signed exports. Run records are
+versioned (`schema_version`); older versions load unchanged with an
+`older_schema` note, and run IDs and digests never silently change.
 
 Data directory resolution (first match wins):
 
@@ -140,7 +164,13 @@ are generated from typed parameter structs (`schemars`); domain failures are
 returned as tool-level error results (`is_error: true`) carrying a
 structured JSON error body, so agents can read and react; only protocol
 faults become JSON-RPC errors. All tool handlers run the service through
-`spawn_blocking`; logs go to stderr only. See `docs/MCP_INTEGRATION.md`.
+`spawn_blocking`; logs go to stderr only. Protocol-level cancellation
+(`notifications/cancelled`) is bridged onto the service's `CancelToken`, so
+an agent cancelling a request cancels the underlying run; partial findings
+are kept and the run is finalized as `cancelled`, never `succeeded`. The
+`tests/parity.rs` suite runs identical invalid inputs through both the CLI
+and the MCP server and asserts identical structured errors. See
+`docs/MCP_INTEGRATION.md`.
 
 ## Determinism
 

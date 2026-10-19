@@ -13,7 +13,10 @@ vortex mcp serve
 
 The server speaks MCP on stdin/stdout and logs to stderr only, so protocol
 output is never corrupted. Inspected targets are never executed by any
-tool.
+tool. The server accepts the same global `--config` flag as the CLI, so a
+config file's limits, per-provider timeouts, and recovery grace apply to
+MCP sessions too; malformed config files abort startup with the exact
+problem on stderr.
 
 ## Tools
 
@@ -31,6 +34,19 @@ Optional parameters (`page`, `page_size`, `max_entries`, `max_matches`,
 `timeout_secs`, `case_sensitive`, `limit`, `section`) are validated and
 clamped; input schemas are generated from typed structs and advertised via
 `tools/list`.
+
+### Cancellation
+
+A client `notifications/cancelled` for a pending request is bridged onto
+the run's cancel token. Cancellation rules (they are tested, not
+aspirational):
+
+* the run stops at its next safe boundary (a run already checkpointing
+  per-file stops within one file);
+* partial findings collected before cancellation are preserved and the
+  run is finalized as `cancelled`, never `succeeded`;
+* the tool result the client receives reports the cancelled status, so the
+  agent knows exactly what it has.
 
 ### Error semantics
 
@@ -104,5 +120,8 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion
 The server is exercised by real protocol sessions in
 `apps/vortex/tests/mcp.rs`: an `rmcp` client connects over an in-memory
 duplex transport and asserts tool discovery, schema validation, pagination,
-error semantics, and evidence round trips — the same pattern used by the
-SDK's own test suite.
+error semantics, cancellation, and evidence round trips — the same pattern
+used by the SDK's own test suite. The `tests/parity.rs` suite runs
+identical invalid inputs through the CLI binary and the MCP server and
+asserts byte-identical structured error bodies, so the two surfaces cannot
+drift apart.

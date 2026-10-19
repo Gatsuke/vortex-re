@@ -1,4 +1,4 @@
-# Evidence Format (Schema Version 1)
+# Evidence Format (Schema Version 2)
 
 Every Vortex-RE investigation produces an **evidence run**: a JSON document
 that is persisted locally (`<data_dir>/runs/<run_id>.json`), served through
@@ -6,17 +6,27 @@ the CLI and MCP, and exportable byte-for-byte (`vortex evidence export`).
 Storage format and export format are identical, so any stored run can be
 validated independently of the tool that wrote it.
 
-* Schema version: **1** (`schema_version` field)
+* Schema version: **2** (`schema_version` field)
 * Serialization: UTF-8 JSON, pretty-printed, trailing newline on export
 * Validation: `vortex_evidence::validate::validate_run` — strict on
   invariants (unique finding ids, resolvable evidence references, RFC 3339
   timestamps, 64-hex digests), tolerant of unknown `details` payloads
 
+### Identity stability policy
+
+Schema changes never silently alter run IDs, target digests, or finding
+identity. A record written by an older minor version loads unchanged; the
+reader annotates it in memory with an `older_schema` load note rather than
+rewriting or rejecting it, and `vortex doctor`'s `schema_versions` check
+reports which schema versions are present in the store. New top-level
+fields are always optional with defaults, so v1 records remain valid v2
+documents.
+
 ## Top-level record
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `schema_version` | number | `1` |
+| `schema_version` | number | `2` |
 | `run_id` | string | `run-<uuid v4>` |
 | `operation` | string | `inspect`, `search`, or `relationships` |
 | `started_at` | string | RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`), second precision |
@@ -35,6 +45,11 @@ validated independently of the tool that wrote it.
 | `errors` | object[] | Structured errors `{ code, message, hint?, stage? }` |
 | `redactions` | object[] | Applied redactions `{ rule, reason, location? }` |
 | `counts` | object | `{ findings, relationships, files_scanned, files_skipped, truncated }` |
+| `owner` | object? | Creating process identity (v2): PID and start time, used by crash recovery to ask the OS whether the owner is still alive |
+| `limits` | object? | Effective `ResourceLimits` for this run (v2) — every knob that can affect evidence, whatever produced it (defaults, config file, or flags) |
+| `params` | object? | Caller parameters that can change findings (v2): `query`, `case_sensitive`, `max_entries`, `max_matches`, `timeout_secs` |
+| `checkpoint` | object? | Latest durable walk checkpoint (v2): `{ phase, next_file_index, files_scanned, files_skipped, saved_at, bytes_remaining, matches_remaining? }`. Cleared on `succeeded`; retained on `failed`/`cancelled`/`partial` so the run can be resumed |
+| `resumed` | object? | Set when `runs resume` continued this run (v2): `{ attempts, from_checkpoint, previous_status }` |
 
 ### Status semantics
 
@@ -145,6 +160,19 @@ Semantics worth internalizing:
   See `vortex doctor` for the effective path on your machine.
 * Export: `vortex evidence export <run-id> --out file.json` — writes the
   exact stored record.
+* Signed export: `vortex evidence export <run-id> --out file.json
+  --signed` — additionally writes an Ed25519 signature sidecar
+  (`file.json.sig`) and appends an entry to the export ledger. The keypair
+  is generated on first use under `<data_dir>/keys/` (owner-only
+  permissions) and announced by `doctor`; the public half is shareable so
+  third parties can verify with `vortex evidence verify file.json --key
+  <pubkey-hex>`.
+* The **export ledger** (`<data_dir>/exports-ledger.jsonl`) is append-only
+  and hash-chained: each JSON line carries the SHA-256 of the exported
+  payload, of the signature, of its predecessor line, and of itself. It
+  detects modification and reordering of past entries. It does **not**
+  detect tail truncation, and it is not a substitute for the signature
+  when authenticity (not just integrity) is required.
 * Delete: remove the JSON file (or the whole data directory). Nothing is
   stored anywhere else; there is no telemetry and no network access.
 * Pagination: `vortex evidence show <run-id> --section findings --page 2
@@ -153,7 +181,8 @@ Semantics worth internalizing:
 
 ## Versioning
 
-`schema_version` gates the format. Version 1 validation is implemented in
-`crates/vortex-evidence/src/validate.rs` and enforced on save and load.
-Future field additions within v1 must be optional. Incompatible changes
-bump the version and keep the old reader where practical.
+`schema_version` gates the format. Version 2 validation is implemented in
+`crates/vortex-evidence/src/validate.rs` and enforced on save and load;
+version 1 records load unchanged with an `older_schema` note. Future field
+additions within v2 must be optional. Incompatible changes bump the
+version and keep the old reader where practical.

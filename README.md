@@ -41,7 +41,7 @@ original source code, or guarantee behavioral reconstruction. It claims
 exactly what its implementation and tests support — see
 [Verifying this release](#verifying-this-release).
 
-## Current capabilities (MVP, Phase One)
+## Current capabilities (Phases One + Two)
 
 * **Inspect** files and directories: SHA-256 digests, format
   identification by magic bytes (ELF, Mach-O, PE, ZIP, PNG, WASM, DEX,
@@ -56,13 +56,28 @@ exactly what its implementation and tests support — see
   source map references, HTML `<script src>` references — each edge with
   scope (`internal`/`external`), resolution status, and the reason when
   unresolved.
-* **Durable evidence**: every operation is a versioned run record, stored
-  locally, paginable, exportable as standalone JSON, and comparable
-  across runs.
+* **Durable evidence**: every operation is a versioned run record (schema
+  v2), stored locally, paginable, exportable as standalone JSON,
+  **optionally Ed25519-signed** with a hash-chained append-only export
+  ledger, and comparable across runs.
+* **Crash recovery and resumable runs**: a `running` record is durably
+  persisted *before* analysis starts and carries its owner process; on the
+  next start, runs whose owner is dead are automatically marked `failed`
+  with an explanation, and interrupted directory runs can be continued
+  from their last checkpoint (`vortex runs resume`).
+* **Cancellation everywhere**: Ctrl-C in the CLI and MCP
+  `notifications/cancelled` both map onto run cancellation — partial
+  findings are preserved and labeled `cancelled`, never `succeeded`.
+* **Configuration**: an optional `vortex-re/config.toml` (or `--config`)
+  overrides resource limits, per-provider timeouts, and recovery grace;
+  unknown keys are rejected by name, all at once. Security-relevant
+  settings stay environment-only.
 * **Diagnostics**: `vortex doctor` reports what works, what is missing,
-  and why.
+  and why — including recovery state, schema versions, the config file,
+  and the signing key.
 * **MCP server**: seven tools over stdio (official `rmcp` SDK), bounded
-  and paginated, tested through a real protocol client.
+  and paginated, tested through a real protocol client; CLI and MCP are
+  held to identical error behavior by a parity test suite.
 * **Safety**: static analysis only (targets are never executed), symlinks
   never followed, path confinement enforced, best-effort secret redaction,
   no network access.
@@ -228,6 +243,9 @@ Then work with the stored evidence:
 ./target/release/vortex runs list
 ./target/release/vortex evidence show <run-id> --section findings --page 1 --page-size 20
 ./target/release/vortex evidence export <run-id> --out evidence.json
+./target/release/vortex evidence export <run-id> --out evidence.json --signed   # + .sig sidecar
+./target/release/vortex evidence verify evidence.json
+./target/release/vortex runs resume <run-id>     # continue an interrupted run
 ./target/release/vortex compare <run-id-a> <run-id-b>
 ./target/release/vortex doctor
 ./target/release/vortex capabilities
@@ -245,8 +263,42 @@ stdout; progress and diagnostics go to stderr).
 | 2 | usage error (invalid arguments) |
 | 3 | unsupported operation/format for this input |
 | 4 | evidence storage error |
-| 5 | cancelled (Ctrl-C or time budget) |
+| 5 | cancelled (Ctrl-C, MCP cancellation, or time budget) |
 | 6 | partial results (limits hit; evidence is still valid) |
+
+## Configuration
+
+Defaults cover normal use. To make overrides persistent, create a config
+file at `~/.config/vortex-re/config.toml` (platform equivalent — see
+`vortex doctor`) or pass any file explicitly:
+
+```bash
+vortex --config /path/to/config.toml inspect ./my-app
+```
+
+```toml
+[limits]                       # every key optional; unlisted keys keep defaults
+max_entries = 100
+timeout_secs = 90
+
+[providers."builtin-static"]   # per-provider settings
+timeout_secs = 60
+
+[recovery]
+grace_secs = 3600              # age threshold when liveness can't decide
+```
+
+Rules the implementation enforces:
+
+* **Precedence**: built-in defaults < `[limits]` in the file <
+  `[providers."<id>"]` in the file < command flags.
+* **Unknown keys and sections are rejected, all named at once** — a
+  silently ignored typo is a misconfiguration you cannot see.
+* **Security-relevant settings (`VORTEX_HOME`, `VORTEX_ALLOWED_ROOTS`) are
+  environment-only by design**: a file that could weaken a policy is a
+  policy downgrade vector.
+* The effective limits of every run — whatever produced them — are
+  recorded inside the run itself.
 
 ## MCP client configuration
 
@@ -279,7 +331,16 @@ can read. Full details and a manual smoke test:
 * One JSON document per run: `$VORTEX_HOME` (or the platform default, see
   `vortex doctor`) → `runs/<run_id>.json`, written atomically.
 * The storage format **is** the export format; exports validate
-  independently of the tool.
+  independently of the tool. Schema is versioned (currently **v2**);
+  records written by older versions load unchanged with an explicit
+  `older_schema` note — run IDs and digests never silently change.
+* Every run records its **effective resource limits** and caller
+  parameters, the **owner process** (for crash recovery), and — for
+  directory runs — the latest durable **checkpoint** so interrupted runs
+  can resume.
+* `evidence export --signed` adds an Ed25519 signature sidecar and appends
+  to a hash-chained, append-only export ledger (`exports-ledger.jsonl`);
+  `evidence verify` checks either against the exporter's public key.
 * Findings carry origins (`observed`/`derived`/`inferred`), locations,
   artifact digests; relationships carry scope, resolution status, and
   reasons. No fabricated confidence numbers.
@@ -298,6 +359,10 @@ Field-by-field specification: [docs/EVIDENCE_FORMAT.md](docs/EVIDENCE_FORMAT.md)
   every cap is reported when hit.
 * Best-effort redaction masks secret-looking values (documented
   heuristics, not a guarantee) before they reach agent-facing output.
+* Tamper evidence: Ed25519-signed exports verify against a public key you
+  can hand to a third party; the export ledger's hash chain detects
+  modification and reordering of past exports (its honest limits — tail
+  truncation, key compromise — are in `docs/THREAT_MODEL.md`).
 * No network access, no telemetry.
 * Intended for software you own or are authorized to inspect — see
   [DISCLAIMER.md](DISCLAIMER.md).
@@ -313,14 +378,14 @@ Full analysis, including residual risks and what Vortex-RE deliberately is
 | Exit code 4 (storage) | `vortex doctor` checks the data directory; set `VORTEX_HOME` to a writable location. |
 | Exit code 6 (partial) | Expected under limits: raise `--max-entries`/`--max-matches`/`--timeout-secs`, or read the rest via `vortex evidence show`. |
 | "unsupported_format" for native binaries | Correct behavior: identification + strings only in this release (see [docs/PROVIDERS.md](docs/PROVIDERS.md)). |
-| Runs stuck in `running` | A process died mid-operation; `vortex runs recover` marks them failed with an explanation. |
+| Runs stuck in `running` | A process died mid-operation. Startup recovery detects dead owners automatically on the next start; `vortex runs recover` is the explicit override (for hung or ambiguous owners). Directory runs with a checkpoint can be continued: `vortex runs resume <run-id>`. |
 | MCP client shows no tools | Ensure the command points at the built binary and your client supports stdio servers; check `vortex mcp serve` starts without errors on stderr. |
 | Agent reading files you didn't intend | Set `VORTEX_ALLOWED_ROOTS` to fence inspection roots. |
 
 ## Testing instructions
 
 ```bash
-cargo test --workspace             # 159 tests at the time of writing
+cargo test --workspace             # 236 tests at the time of writing
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
@@ -329,7 +394,10 @@ The suites: unit tests per crate; CLI integration tests that run the real
 binary and assert on exit codes and JSON; **golden tests** pinning the
 fixture's exact relationships, findings, and search locations
 (`fixtures/expected-results/`); MCP protocol tests driving the server
-through an `rmcp` client over an in-memory transport. Test map:
+through an `rmcp` client over an in-memory transport; **parity tests**
+asserting CLI and MCP produce identical structured errors; and an
+**adversarial corpus** (giant single line, deep tree, pathological package
+graph) that must produce `partial`, never a crash. Test map:
 [tests/README.md](tests/README.md).
 
 ### Verifying this release
@@ -353,7 +421,12 @@ The acceptance bar for the MVP, with the evidence that meets it:
 | Output bounded + paginated | limits tests; MCP pagination tests |
 | Malformed input → controlled errors | malformed-manifest tests; CLI error tests |
 | Targets never executed | no execution path exists; static-only rule enforced in review |
-| Tests cover functionality | 176 tests, incl. golden + protocol suites |
+| kill -9 mid-run recovers cleanly | `kill_nine_mid_run_recovers_on_next_start` (CLI suite) |
+| Cancellation preserves partial findings | cancellation tests in the MCP suite; `cancelled` never `succeeded` |
+| CLI and MCP agree on errors | parity suite (`tests/parity.rs`) runs both surfaces on identical inputs |
+| Signed exports verify | `signed_export_round_trip_through_the_cli` (CLI suite) |
+| Config precedence holds | `config_flag_overrides_and_fails_loudly` (CLI suite) |
+| Tests cover functionality | 236 tests, incl. golden, protocol, parity, and adversarial suites |
 | No known ignored security issue | docs/THREAT_MODEL.md tracks residual risks explicitly |
 
 ## Tested platforms
@@ -366,13 +439,14 @@ The acceptance bar for the MVP, with the evidence that meets it:
 
 ## Roadmap
 
-Phase One (this release) → Phase Two (reliability: automatic crash
-recovery, resumable runs, protocol-level cancellation) → Phase Three
-(broader static analysis: safe archive extraction, native structural
-parsing, Rizin after license review) → Phase Four (source map
-reconstruction, deeper comparisons) → Phase Five (controlled dynamic
-analysis) → Phase Six (patch-and-verify labs). Details and acceptance
-criteria per phase: [docs/ROADMAP.md](docs/ROADMAP.md).
+Phase One (v0.1.0, working MVP) → Phase Two (**shipped**: automatic crash
+recovery, resumable runs, protocol-level cancellation, signed exports +
+ledger, parity tests, adversarial corpus, config file with per-provider
+timeouts) → Phase Three (broader static analysis: safe archive extraction,
+native structural parsing, Rizin after license review) → Phase Four
+(source map reconstruction, deeper comparisons) → Phase Five (controlled
+dynamic analysis) → Phase Six (patch-and-verify labs). Details and
+acceptance criteria per phase: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 The roadmap is informed by systematic study of real-world failures in the
 category: [docs/UPSTREAM_LESSONS.md](docs/UPSTREAM_LESSONS.md) analyzes
