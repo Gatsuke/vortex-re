@@ -6,6 +6,7 @@
 //! entirely offline on ordinary files, JavaScript/JSON text, and printable
 //! strings — no external reverse-engineering engines required.
 
+pub mod archive;
 pub mod builtin;
 pub mod identify;
 pub mod javascript;
