@@ -9,6 +9,7 @@
 pub mod builtin;
 pub mod identify;
 pub mod javascript;
+pub mod native;
 pub mod provider;
 pub mod search;
 pub mod strings;

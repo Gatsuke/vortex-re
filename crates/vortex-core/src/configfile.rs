@@ -40,6 +40,8 @@ const LIMIT_KEYS: &[&str] = &[
     "min_string_length",
     "max_string_length",
     "max_strings_per_file",
+    "max_archive_members",
+    "max_archive_member_bytes",
     "max_line_context_bytes",
     "timeout_secs",
     "page_size_default",
@@ -154,6 +156,10 @@ pub struct PartialLimits {
     pub max_string_length: Option<usize>,
     /// See [`ResourceLimits::max_strings_per_file`].
     pub max_strings_per_file: Option<usize>,
+    /// See [`ResourceLimits::max_archive_members`].
+    pub max_archive_members: Option<usize>,
+    /// See [`ResourceLimits::max_archive_member_bytes`].
+    pub max_archive_member_bytes: Option<u64>,
     /// See [`ResourceLimits::max_line_context_bytes`].
     pub max_line_context_bytes: Option<usize>,
     /// See [`ResourceLimits::timeout_secs`].
@@ -239,6 +245,12 @@ impl FileConfig {
             }
             if let Some(v) = file.max_strings_per_file {
                 limits.max_strings_per_file = v;
+            }
+            if let Some(v) = file.max_archive_members {
+                limits.max_archive_members = v;
+            }
+            if let Some(v) = file.max_archive_member_bytes {
+                limits.max_archive_member_bytes = v;
             }
             if let Some(v) = file.max_line_context_bytes {
                 limits.max_line_context_bytes = v;
@@ -382,6 +394,8 @@ max_imports_per_file = 17
 min_string_length = 4
 max_string_length = 200
 max_strings_per_file = 18
+max_archive_members = 24
+max_archive_member_bytes = 4096
 max_line_context_bytes = 19
 timeout_secs = 20
 page_size_default = 21
@@ -395,6 +409,8 @@ grace_secs = 23
         assert_eq!(limits.max_files, 11);
         assert_eq!(limits.max_total_bytes, 10000);
         assert_eq!(limits.max_matches_per_file, 16);
+        assert_eq!(limits.max_archive_members, 24);
+        assert_eq!(limits.max_archive_member_bytes, 4096);
         assert_eq!(limits.page_size_max, 22);
         assert_eq!(config.recovery_grace_secs(), 23);
     }

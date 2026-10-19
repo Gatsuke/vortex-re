@@ -114,7 +114,7 @@ def build_elf64():
         elf_section_header(True, 7, SHT_DYNSYM, dynsym_off, len(dynsym),
                            link=3, entsize=24),                        # .dynsym
         elf_section_header(True, 15, SHT_STRTAB, dynstr_off, len(dynstr)),   # .dynstr
-        elf_section_header(True, 24, SHT_STRTAB, shstr_off, len(shstrtab)),  # .shstrtab
+        elf_section_header(True, 23, SHT_STRTAB, shstr_off, len(shstrtab)),  # .shstrtab
     ]
     ehdr = e_ident + struct.pack(
         "<HHIQQQIHHHHHH",
@@ -162,7 +162,7 @@ def build_elf32():
         elf_section_header(False, 7, SHT_DYNSYM, dynsym_off, len(dynsym),
                            link=3, entsize=16),
         elf_section_header(False, 15, SHT_STRTAB, dynstr_off, len(dynstr)),
-        elf_section_header(False, 24, SHT_STRTAB, shstr_off, len(shstrtab)),
+        elf_section_header(False, 23, SHT_STRTAB, shstr_off, len(shstrtab)),
     ]
     ehdr = e_ident + struct.pack(
         "<HHIIIIIHHHHHH",

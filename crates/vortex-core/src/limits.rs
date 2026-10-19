@@ -33,6 +33,10 @@ pub struct ResourceLimits {
     pub max_string_length: usize,
     /// Maximum printable strings extracted per binary file.
     pub max_strings_per_file: usize,
+    /// Maximum archive members listed per archive (zip/asar).
+    pub max_archive_members: usize,
+    /// Maximum decompressed bytes read from a single archive member.
+    pub max_archive_member_bytes: u64,
     /// Maximum line length echoed back in search results.
     pub max_line_context_bytes: usize,
     /// Time budget for one operation, in seconds.
@@ -58,6 +62,8 @@ impl Default for ResourceLimits {
             min_string_length: 5,
             max_string_length: 256,
             max_strings_per_file: 50,
+            max_archive_members: 500,
+            max_archive_member_bytes: 4 * 1024 * 1024,
             max_line_context_bytes: 400,
             timeout_secs: 30,
             page_size_default: 20,
@@ -95,6 +101,12 @@ impl ResourceLimits {
         }
         if self.timeout_secs == 0 {
             problems.push("timeout_secs must be >= 1");
+        }
+        if self.max_archive_members == 0 {
+            problems.push("max_archive_members must be >= 1");
+        }
+        if self.max_archive_member_bytes == 0 {
+            problems.push("max_archive_member_bytes must be >= 1");
         }
         if self.page_size_default == 0 || self.page_size_max == 0 {
             problems.push("page sizes must be >= 1");
