@@ -25,6 +25,9 @@ fn service_for_tests() -> (Arc<VortexService>, tempfile::TempDir) {
         limits: ResourceLimits::default(),
         allowed_roots: None,
         notes: Vec::new(),
+        provider_overrides: Default::default(),
+        stale_run_grace_secs: 3600,
+        config_file: None,
     };
     (Arc::new(VortexService::new(config).expect("service")), dir)
 }

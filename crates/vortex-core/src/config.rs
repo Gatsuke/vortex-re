@@ -1,12 +1,18 @@
-//! Runtime configuration resolved from the environment.
+//! Runtime configuration resolved from the environment and an optional
+//! TOML config file.
 //!
-//! Vortex-RE is local-first: all configuration is environment-based for the
-//! MVP (no config file), which keeps behavior transparent and easy to audit.
-//! Every knob that affects evidence is recorded inside each run record.
+//! Vortex-RE is local-first: security-relevant settings
+//! (`VORTEX_HOME`, `VORTEX_ALLOWED_ROOTS`) are environment-only, while
+//! resource limits, per-provider timeouts, and recovery tuning may come
+//! from `vortex-re/config.toml` (see [`crate::configfile`]). Every knob
+//! that affects evidence is recorded inside each run record.
 
+use crate::configfile::FileConfig;
+use crate::error::VortexError;
 use crate::limits::ResourceLimits;
 use crate::paths;
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// Environment variable that overrides the data directory entirely.
 pub const ENV_VORTEX_HOME: &str = "VORTEX_HOME";
@@ -27,6 +33,13 @@ pub struct VortexConfig {
     pub allowed_roots: Option<Vec<PathBuf>>,
     /// Human-readable notes about how configuration was resolved.
     pub notes: Vec<String>,
+    /// Per-provider overrides from the config file (keyed by provider id).
+    pub provider_overrides: BTreeMap<String, crate::configfile::ProviderOverrides>,
+    /// Age threshold (seconds) startup recovery uses when process liveness
+    /// cannot decide.
+    pub stale_run_grace_secs: u64,
+    /// The config file this configuration was built from, when one loaded.
+    pub config_file: Option<PathBuf>,
 }
 
 impl VortexConfig {
@@ -66,7 +79,72 @@ impl VortexConfig {
             limits: ResourceLimits::default(),
             allowed_roots,
             notes,
+            provider_overrides: BTreeMap::new(),
+            stale_run_grace_secs: 3600,
+            config_file: None,
         }
+    }
+
+    /// Resolve configuration from the environment plus an optional config
+    /// file: `explicit` (from `--config`), else the default location when it
+    /// exists. An explicit path that does not exist or does not parse is an
+    /// error with the exact problem listed; a missing default is the normal
+    /// no-file state.
+    pub fn resolve(explicit: Option<PathBuf>) -> Result<Self, VortexError> {
+        let mut config = Self::from_env();
+        let was_explicit = explicit.is_some();
+        let path = match explicit {
+            Some(path) => Some(path),
+            None => default_config_path(),
+        };
+        let Some(path) = path else {
+            return Ok(config);
+        };
+        if !path.exists() {
+            if was_explicit {
+                return Err(VortexError::validation(format!(
+                    "config file {} not found",
+                    path.display()
+                ))
+                .with_hint("check the path passed to --config"));
+            }
+            return Ok(config);
+        }
+        let text = std::fs::read_to_string(&path).map_err(|err| {
+            VortexError::validation(format!("cannot read {}: {err}", path.display()))
+        })?;
+        let file = FileConfig::parse(&text)
+            .map_err(|problems| crate::configfile::config_error(&path, &problems))?;
+        config.limits = file.effective_limits(config.limits);
+        config.stale_run_grace_secs = file.recovery_grace_secs();
+        let mut applied: Vec<String> = Vec::new();
+        for (provider_id, overrides) in file.providers.iter().flatten() {
+            if let Some(timeout) = overrides.timeout_secs {
+                if timeout == 0 {
+                    return Err(VortexError::validation(format!(
+                        "providers.'{provider_id}'.timeout_secs must be >= 1"
+                    )));
+                }
+                applied.push(format!("{provider_id}: timeout {timeout}s"));
+            }
+            config
+                .provider_overrides
+                .insert(provider_id.clone(), overrides.clone());
+        }
+        config.config_file = Some(path.clone());
+        config.notes.push(format!(
+            "config file loaded from {} (limits overridden where listed)",
+            path.display()
+        ));
+        if !applied.is_empty() {
+            config
+                .notes
+                .push(format!("provider overrides: {}", applied.join(", ")));
+        }
+        config
+            .notes
+            .push(format!("recovery grace: {}s", config.stale_run_grace_secs));
+        Ok(config)
     }
 
     /// Directory holding persisted run records.
@@ -102,6 +180,44 @@ impl VortexConfig {
         ))
         .with_hint("add the root to VORTEX_ALLOWED_ROOTS or unset it to remove the restriction"))
     }
+}
+
+/// Default config file location (`<config_dir>/vortex-re/config.toml`),
+/// following the same platform conventions as the data directory.
+pub fn default_config_path() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Some(Path::new(&xdg).join(crate::APP_NAME).join("config.toml"));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            if cfg!(target_os = "macos") {
+                return Some(
+                    Path::new(&home)
+                        .join("Library/Application Support")
+                        .join(crate::APP_NAME)
+                        .join("config.toml"),
+                );
+            }
+            return Some(
+                Path::new(&home)
+                    .join(".config")
+                    .join(crate::APP_NAME)
+                    .join("config.toml"),
+            );
+        }
+    }
+    if let Some(app_data) = std::env::var_os("AppData") {
+        if !app_data.is_empty() {
+            return Some(
+                Path::new(&app_data)
+                    .join(crate::APP_NAME)
+                    .join("config.toml"),
+            );
+        }
+    }
+    None
 }
 
 /// Compute the default data directory without side effects.
@@ -182,5 +298,65 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    #[test]
+    fn resolve_applies_config_file_over_defaults() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile_dir();
+        std::env::set_var(ENV_XDG_DATA_HOME, &dir);
+
+        let file = std::path::Path::new(&dir).join("cfg.toml");
+        std::fs::write(
+            &file,
+            "[limits]\nmax_entries = 77\ntimeout_secs = 55\n\n[providers.\"builtin-static\"]\ntimeout_secs = 44\n\n[recovery]\ngrace_secs = 33\n",
+        )
+        .unwrap();
+
+        let config = VortexConfig::resolve(Some(file.clone())).expect("resolve");
+        assert_eq!(config.limits.max_entries, 77);
+        assert_eq!(config.limits.timeout_secs, 55);
+        assert_eq!(config.stale_run_grace_secs, 33);
+        assert_eq!(
+            config
+                .provider_overrides
+                .get("builtin-static")
+                .and_then(|o| o.timeout_secs),
+            Some(44)
+        );
+        assert_eq!(config.config_file.as_deref(), Some(file.as_path()));
+        assert!(config
+            .notes
+            .iter()
+            .any(|note| note.starts_with("config file loaded")));
+
+        std::env::remove_var(ENV_XDG_DATA_HOME);
+    }
+
+    #[test]
+    fn resolve_rejects_missing_explicit_file() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var(ENV_XDG_DATA_HOME);
+        let err = VortexConfig::resolve(Some(PathBuf::from("/definitely/not/here.toml")))
+            .expect_err("missing explicit file");
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+        assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn resolve_reports_malformed_file_precisely() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var(ENV_XDG_DATA_HOME);
+        let dir = tempfile_dir();
+        let file = std::path::Path::new(&dir).join("broken.toml");
+        std::fs::write(&file, "[limits]\ngarbage =\n").unwrap();
+        let err = VortexConfig::resolve(Some(file)).expect_err("malformed file");
+        assert!(err.message.contains("not valid TOML"), "{err}");
     }
 }

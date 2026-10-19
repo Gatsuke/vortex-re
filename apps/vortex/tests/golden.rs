@@ -29,6 +29,9 @@ fn service_in_temp() -> (VortexService, tempfile::TempDir) {
         limits: ResourceLimits::default(),
         allowed_roots: None,
         notes: Vec::new(),
+        provider_overrides: Default::default(),
+        stale_run_grace_secs: 3600,
+        config_file: None,
     };
     let service = VortexService::new(config).expect("service");
     (service, dir)

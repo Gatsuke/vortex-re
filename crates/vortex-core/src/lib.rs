@@ -5,6 +5,7 @@
 //! best-effort redaction) used by every other crate in the workspace.
 
 pub mod config;
+pub mod configfile;
 pub mod digest;
 pub mod error;
 pub mod limits;

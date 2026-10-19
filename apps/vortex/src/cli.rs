@@ -20,6 +20,11 @@ use std::path::PathBuf;
                   or inferred), its source location, and its limitations."
 )]
 pub struct Cli {
+    /// Path to a config file (vortex-re/config.toml format). Without this,
+    /// the default location is used when it exists.
+    #[arg(long, global = true)]
+    pub config: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -46,9 +51,10 @@ pub enum Command {
         /// Print machine-readable JSON.
         #[arg(long)]
         json: bool,
-        /// Maximum entries in summaries and per-file listings.
-        #[arg(long, default_value_t = 50)]
-        max_entries: usize,
+        /// Maximum entries in summaries and per-file listings (default 50,
+        /// or the config file's [limits] max_entries when set).
+        #[arg(long)]
+        max_entries: Option<usize>,
         /// Time budget for the operation, in seconds.
         #[arg(long)]
         timeout_secs: Option<u64>,

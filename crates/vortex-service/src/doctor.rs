@@ -317,6 +317,42 @@ pub fn run_doctor(service: &VortexService) -> DoctorReport {
         });
     }
 
+    // Config file resolution.
+    {
+        let notes = &service.config().notes;
+        let has_file = service.config().config_file.is_some();
+        let mentioned = notes.iter().any(|note| note.starts_with("config file"));
+        let status = if mentioned {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Info
+        };
+        let detail = if let Some(path) = &service.config().config_file {
+            let overrides: Vec<&String> = notes
+                .iter()
+                .filter(|note| {
+                    note.starts_with("provider overrides") || note.starts_with("recovery grace")
+                })
+                .collect();
+            format!("{} ({} applied note(s))", path.display(), overrides.len())
+        } else {
+            "no config file loaded; defaults apply".to_string()
+        };
+        checks.push(CheckResult {
+            name: "config_file".to_string(),
+            status,
+            detail,
+            hint: if has_file {
+                None
+            } else {
+                Some(
+                    "create vortex-re/config.toml or pass --config to override defaults"
+                        .to_string(),
+                )
+            },
+        });
+    }
+
     // Signing key for --signed exports.
     {
         let public_key_file = service.config().data_dir.join("keys").join("signing.pub");
@@ -495,6 +531,9 @@ mod tests {
             limits: ResourceLimits::default(),
             allowed_roots: None,
             notes: Vec::new(),
+            provider_overrides: Default::default(),
+            stale_run_grace_secs: 3600,
+            config_file: None,
         };
         let service = VortexService::new(config).unwrap();
         let report = service.doctor();
@@ -523,6 +562,9 @@ mod tests {
             limits: ResourceLimits::default(),
             allowed_roots: None,
             notes: Vec::new(),
+            provider_overrides: Default::default(),
+            stale_run_grace_secs: 3600,
+            config_file: None,
         };
         let service = VortexService::new(config).unwrap();
         // Store one healthy run and one corrupt record.

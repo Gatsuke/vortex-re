@@ -555,6 +555,9 @@ fn runs_resume_through_the_cli() {
         limits: vortex_core::limits::ResourceLimits::default(),
         allowed_roots: None,
         notes: Vec::new(),
+        provider_overrides: Default::default(),
+        stale_run_grace_secs: 3600,
+        config_file: None,
     };
     let service = VortexService::new(config).expect("service");
 
@@ -711,4 +714,148 @@ fn signed_export_round_trip_through_the_cli() {
         .collect();
     assert!(names.contains(&"signing_key"));
     assert!(names.contains(&"export_ledger"));
+}
+/// The --config flag: overrides apply end to end, flags beat the file, and
+/// malformed files fail precisely.
+#[test]
+fn config_flag_overrides_and_fails_loudly() {
+    let home = tempfile::tempdir().expect("home");
+    let cfg = home.path().join("vortex.toml");
+    std::fs::write(
+        &cfg,
+        "[limits]\nmax_entries = 7\n\n[providers.\"builtin-static\"]\ntimeout_secs = 21\n\n[recovery]\ngrace_secs = 99\n",
+    )
+    .unwrap();
+    let fixture = fixture().to_str().unwrap().to_string();
+    let cfg_str = cfg.to_str().unwrap().to_string();
+
+    // A run under the config file stores the effective limits: the file's
+    // max_entries (not clobbered by the flag default) and the provider's
+    // timeout (file [providers.X] beats the file/global default of 30s).
+    let run = run_vortex_shared(
+        home.path(),
+        &["--config", &cfg_str, "inspect", &fixture, "--json"],
+        None,
+    );
+    assert!(
+        run.output.status.success(),
+        "stderr: {}",
+        stderr(&run.output)
+    );
+    let run_id = stdout_json(&run.output)["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("runs").join(format!("{run_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["limits"]["max_entries"], 7);
+    assert_eq!(record["limits"]["timeout_secs"], 21);
+
+    // An explicit flag beats the config file's provider override.
+    let run = run_vortex_shared(
+        home.path(),
+        &[
+            "--config",
+            &cfg_str,
+            "inspect",
+            &fixture,
+            "--timeout-secs",
+            "5",
+            "--json",
+        ],
+        None,
+    );
+    assert!(
+        run.output.status.success(),
+        "stderr: {}",
+        stderr(&run.output)
+    );
+    let run_id2 = stdout_json(&run.output)["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let record2: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("runs").join(format!("{run_id2}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record2["limits"]["timeout_secs"], 5);
+
+    // The stored run is readable through evidence show with the same config.
+    let run = run_vortex_shared(
+        home.path(),
+        &[
+            "--config",
+            &cfg_str,
+            "evidence",
+            "show",
+            &run_id,
+            "--section",
+            "overview",
+            "--json",
+        ],
+        None,
+    );
+    assert!(
+        run.output.status.success(),
+        "stderr: {}",
+        stderr(&run.output)
+    );
+
+    // Doctor reports the config file.
+    let run = run_vortex_shared(
+        home.path(),
+        &["--config", &cfg_str, "doctor", "--json"],
+        None,
+    );
+    assert!(run.output.status.success());
+    let report = stdout_json(&run.output);
+    let config_check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "config_file")
+        .expect("config check")
+        .clone();
+    assert!(config_check["detail"]
+        .as_str()
+        .unwrap()
+        .contains("vortex.toml"));
+    assert_eq!(config_check["status"], "ok");
+
+    // A malformed config file fails with the exact problem.
+    let broken = home.path().join("broken.toml");
+    std::fs::write(&broken, "[limits]\ngarbage =\n").unwrap();
+    let broken_str = broken.to_str().unwrap().to_string();
+    let run = run_vortex_shared(
+        home.path(),
+        &["--config", &broken_str, "doctor", "--json"],
+        None,
+    );
+    assert_eq!(run.output.status.code(), Some(1));
+    let text = stderr(&run.output);
+    assert!(text.contains("not valid TOML"), "stderr: {text}");
+
+    // A missing explicit config file is an error, not silence.
+    let run = run_vortex_shared(
+        home.path(),
+        &["--config", "/definitely/not/here.toml", "doctor", "--json"],
+        None,
+    );
+    assert_eq!(run.output.status.code(), Some(1));
+    assert!(stderr(&run.output).contains("not found"));
+
+    // An unknown key is listed by name.
+    let typo = home.path().join("typo.toml");
+    std::fs::write(&typo, "[limits]\nmax_entriess = 5\n").unwrap();
+    let typo_str = typo.to_str().unwrap().to_string();
+    let run = run_vortex_shared(
+        home.path(),
+        &["--config", &typo_str, "doctor", "--json"],
+        None,
+    );
+    assert_eq!(run.output.status.code(), Some(1));
+    let text = stderr(&run.output);
+    assert!(text.contains("max_entriess"), "stderr: {text}");
 }

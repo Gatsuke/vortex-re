@@ -203,11 +203,12 @@ impl VortexService {
     /// resume hint); ambiguous ones are left in place and reported through
     /// [`VortexService::startup_recovery`].
     pub fn new(config: VortexConfig) -> VortexResult<Self> {
+        let recovery_grace = Duration::from_secs(config.stale_run_grace_secs);
         let store =
             Arc::new(FileSystemRunStore::open(config.runs_dir()).map_err(|err| err.into_vortex())?);
         let startup_recovery = store
             .recover_interrupted_runs(RecoveryOptions {
-                age_grace: STARTUP_RECOVERY_GRACE,
+                age_grace: recovery_grace,
                 force_aged: false,
             })
             .map_err(|err| err.into_vortex())?;
@@ -366,6 +367,20 @@ impl VortexService {
         let provider = self.providers.first().ok_or_else(|| {
             VortexError::new(ErrorCode::MissingProvider, "no providers are registered")
         })?;
+        // Per-provider timeout from the config file. Precedence is
+        // defaults < file [limits] < file [providers.X] < flags, so the
+        // override applies only when no flag (or flag default) set a
+        // timeout for this invocation.
+        if options.timeout_secs.is_none() {
+            if let Some(provider_timeout) = self
+                .config
+                .provider_overrides
+                .get(provider.descriptor().id.as_str())
+                .and_then(|overrides| overrides.timeout_secs)
+            {
+                limits.timeout_secs = provider_timeout;
+            }
+        }
         provider.validate_request(&self.analysis_request(
             &target,
             &identity,
@@ -816,7 +831,7 @@ impl VortexService {
                     .recover_single_interrupted(
                         run_id,
                         RecoveryOptions {
-                            age_grace: STARTUP_RECOVERY_GRACE,
+                            age_grace: Duration::from_secs(self.config.stale_run_grace_secs),
                             force_aged: false,
                         },
                     )
@@ -1245,6 +1260,9 @@ mod tests {
             limits: ResourceLimits::default(),
             allowed_roots: None,
             notes: Vec::new(),
+            provider_overrides: Default::default(),
+            stale_run_grace_secs: 3600,
+            config_file: None,
         };
         VortexService::new(config).expect("service")
     }
@@ -1458,6 +1476,9 @@ mod tests {
             limits: ResourceLimits::default(),
             allowed_roots: Some(vec![root.clone()]),
             notes: Vec::new(),
+            provider_overrides: Default::default(),
+            stale_run_grace_secs: 3600,
+            config_file: None,
         };
         let service = VortexService::new(config).unwrap();
         assert!(service
@@ -1846,5 +1867,46 @@ mod tests {
             .unwrap();
         assert_eq!(ledger_check.status, crate::doctor::CheckStatus::Ok);
         assert!(ledger_check.detail.contains("1 export(s)"));
+    }
+
+    #[test]
+    fn provider_timeout_override_applies_below_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(
+            "builtin-static".to_string(),
+            vortex_core::configfile::ProviderOverrides {
+                timeout_secs: Some(44),
+            },
+        );
+        let config = VortexConfig {
+            data_dir: dir.path().to_path_buf(),
+            limits: ResourceLimits::default(),
+            allowed_roots: None,
+            notes: Vec::new(),
+            provider_overrides: overrides,
+            stale_run_grace_secs: 3600,
+            config_file: None,
+        };
+        let service = VortexService::new(config).unwrap();
+        let app = fixture(dir.path());
+
+        // No flag: the provider override wins over the global default (30s).
+        let result = service
+            .inspect(&app, &OperationOptions::default(), &CancelToken::new())
+            .unwrap();
+        let stored = service.store().load(&result.run_id.unwrap()).unwrap();
+        assert_eq!(stored.limits.unwrap().timeout_secs, 44);
+
+        // A flag beats the provider override.
+        let options = OperationOptions {
+            timeout_secs: Some(9),
+            ..OperationOptions::default()
+        };
+        let result = service
+            .inspect(&app, &options, &CancelToken::new())
+            .unwrap();
+        let stored = service.store().load(&result.run_id.unwrap()).unwrap();
+        assert_eq!(stored.limits.unwrap().timeout_secs, 9);
     }
 }

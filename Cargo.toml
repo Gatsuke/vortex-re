@@ -31,6 +31,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tokio-util = "0.7"
 ed25519-dalek = "2"
+toml = "0.9"
 getrandom = "0.3"
 rmcp = { version = "3.5", features = ["client", "transport-io"] }
 tempfile = "3"

@@ -78,6 +78,9 @@ async fn mcp_error_json(case: &Case, shared_home: &std::path::Path) -> serde_jso
         limits: ResourceLimits::default(),
         allowed_roots: case.mcp_allowed_roots.clone(),
         notes: Vec::new(),
+        provider_overrides: Default::default(),
+        stale_run_grace_secs: 3600,
+        config_file: None,
     };
     let service = VortexService::new(config).expect("service");
     let service = std::sync::Arc::new(service);
@@ -254,6 +257,9 @@ fn doctor_reports_recovery_and_schema_versions() {
         limits: ResourceLimits::default(),
         allowed_roots: None,
         notes: Vec::new(),
+        provider_overrides: Default::default(),
+        stale_run_grace_secs: 3600,
+        config_file: None,
     };
     let service = VortexService::new(config).expect("service");
 
@@ -373,6 +379,9 @@ fn recovery_hints_stay_platform_honest() {
         limits: ResourceLimits::default(),
         allowed_roots: None,
         notes: Vec::new(),
+        provider_overrides: Default::default(),
+        stale_run_grace_secs: 3600,
+        config_file: None,
     };
     let service = VortexService::new(config).expect("service");
     let report = service.doctor();

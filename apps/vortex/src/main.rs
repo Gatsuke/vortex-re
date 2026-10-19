@@ -33,13 +33,22 @@ async fn run(cli: Cli) -> ExitCode {
     match cli.command {
         Command::Mcp {
             command: McpCommand::Serve,
-        } => serve_mcp().await,
-        command => run_command(command).await,
+        } => serve_mcp(cli.config).await,
+        command => run_command(command, cli.config).await,
     }
 }
 
-async fn serve_mcp() -> ExitCode {
-    let config = VortexConfig::from_env();
+async fn serve_mcp(config_path: Option<std::path::PathBuf>) -> ExitCode {
+    let config = match VortexConfig::resolve(config_path) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("vortex: error: {err}");
+            if let Some(hint) = &err.hint {
+                eprintln!("hint: {hint}");
+            }
+            return ExitCode::from(err.code.exit_code() as u8);
+        }
+    };
     match VortexService::new(config) {
         Ok(service) => {
             report_startup_recovery(&service);
@@ -59,8 +68,10 @@ async fn serve_mcp() -> ExitCode {
     }
 }
 
-fn build_service() -> Result<Arc<VortexService>, VortexError> {
-    let config = VortexConfig::from_env();
+fn build_service(
+    config_path: Option<std::path::PathBuf>,
+) -> Result<Arc<VortexService>, VortexError> {
+    let config = VortexConfig::resolve(config_path)?;
     let service = VortexService::new(config).map(Arc::new).map_err(|err| {
         VortexError::new(
             ErrorCode::Storage,
@@ -98,8 +109,8 @@ fn report_startup_recovery(service: &VortexService) {
     }
 }
 
-async fn run_command(command: Command) -> ExitCode {
-    let service = match build_service() {
+async fn run_command(command: Command, config_path: Option<std::path::PathBuf>) -> ExitCode {
+    let service = match build_service(config_path) {
         Ok(service) => service,
         Err(err) => {
             eprintln!("vortex: error: {err}");
@@ -142,7 +153,7 @@ async fn run_command(command: Command) -> ExitCode {
         } => {
             let options = OperationOptions {
                 invocation: format!("vortex inspect {}", path.display()),
-                max_entries: Some(max_entries),
+                max_entries,
                 timeout_secs,
                 persist: !no_store,
                 ..OperationOptions::default()
