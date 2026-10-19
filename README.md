@@ -41,13 +41,31 @@ original source code, or guarantee behavioral reconstruction. It claims
 exactly what its implementation and tests support — see
 [Verifying this release](#verifying-this-release).
 
-## Current capabilities (Phases One + Two + Three)
+## Current capabilities (Phases One through Four)
 
 * **Inspect** files and directories: SHA-256 digests, format
   identification by magic bytes (ELF, Mach-O, PE, ZIP, PNG, WASM, DEX,
   SQLite, ...; asar by structural check), text statistics, `package.json`
   manifests, Electron classification, entry points, source map references,
   printable strings (redacted).
+* **Reconstruct source maps** (Phase Four): a dedicated Source Map v3
+  parser decodes the `mappings` field with the exact revision-3
+  continuation semantics. Inspecting a `.map` yields the structural
+  document (sources, names, `sourcesContent` measured by presence and
+  byte length — never echoed, unusable segments counted by exact
+  reason); inspecting a bundle resolves its `sourceMappingURL` to a
+  sibling map and reconstructs: per-source aggregates with first/last
+  mappings, sample segments verbatim with their ordinals as provenance,
+  coverage against the bundle's real line count, and the `file`-field
+  correspondence check. Every result carries the honest framing: the
+  format has no checksum linkage, so bundle correspondence is checked
+  textually, never verified.
+* **Report imported bindings beyond import edges** (Phase Four): which
+  bindings each import introduces (ESM and CJS shapes, aliases,
+  destructuring, member-of requires) and where they are referenced —
+  call/member/reexport/bare with locations — plus the statically-unused
+  imports. Token-level and scope-unaware by design; labeled `inferred`
+  with standing caveats, never as runtime paths.
 * **Parse native binaries structurally**: ELF (32/64-bit, both endians —
   header, sections, `.dynsym` undefined imports) and PE/COFF (PE32/PE32+ —
   headers, sections, import/export tables). Structural only, honestly:
@@ -68,13 +86,22 @@ exactly what its implementation and tests support — see
   binary files are skipped and counted.
 * **Trace relationships** in JavaScript/Electron artifacts: `import` /
   `require` / dynamic import / `export-from`, declared dependencies,
-  source map references, HTML `<script src>` references — each edge with
+  source map references, HTML `<script src>` references, and
+  `maps_to_source` edges from bundle source maps — each edge with
   scope (`internal`/`external`), resolution status, and the reason when
   unresolved.
+* **Compare runs with dependency-change semantics** (Phase Four):
+  `vortex compare` still reports presence diffs, and additionally
+  characterizes what changed *inside* matched findings: per-dependency
+  added/removed/range-changed/section-moved (range strings verbatim,
+  no semver interpretation ever), per-file import changes, ELF/PE
+  symbol-level changes, and source map count changes. Identical runs
+  stay quiet — no note is added when nothing changed.
 * **Durable evidence**: every operation is a versioned run record (schema
   v2), stored locally, paginable, exportable as standalone JSON,
   **optionally Ed25519-signed** with a hash-chained append-only export
-  ledger, and comparable across runs.
+  ledger, and comparable across runs — with the Phase Four semantic
+  layer on top of the presence diff.
 * **Crash recovery and resumable runs**: a `running` record is durably
   persisted *before* analysis starts and carries its owner process; on the
   next start, runs whose owner is dead are automatically marked `failed`
@@ -101,10 +128,17 @@ exactly what its implementation and tests support — see
 
 * Disassembly/decompilation of native executables — identified and
   string-extracted only; deeper analysis reports `unsupported_operation`.
-* .NET assemblies, Android DEX/APK contents, firmware extraction.
-* Archive extraction (zip/asar/tar) — deliberately deferred until the
-  safety review in `docs/THREAT_MODEL.md` is done.
 * Any runtime/dynamic analysis, instrumentation, or patching.
+* Archive extraction (zip/asar/tar) — deliberately not implemented:
+  members are listed and read in memory under bounded budgets, never
+  extracted to disk (the Phase Three safety review concluded
+  no-extraction is the design, and `docs/THREAT_MODEL.md` records it).
+* Semver interpretation of dependency range changes — ranges are
+  compared as recorded text; `^1.2.8` -> `^2.0.0` is never called an
+  upgrade, downgrade, or breaking change.
+* Scope-aware binding analysis — the binding layer is token-level by
+  design (shadowing is disclosed, not resolved); maps inside archives
+  are listed, not reconstructed.
 * Recovering original source code; claiming behavioral equivalence.
 
 `vortex doctor` lists all of this at runtime — it is the source of truth

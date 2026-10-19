@@ -40,11 +40,11 @@ The built-in provider works fully offline on ordinary files. It requires
 | `inspect_files` | Implemented + tested |
 | `inspect_directories` | Implemented + tested |
 | `search_text` | Implemented + tested |
-| `trace_relationships` | Implemented + tested (CommonJS/ESM scanning, package manifests, source maps, HTML scripts) |
+| `trace_relationships` | Implemented + tested (CommonJS/ESM scanning, package manifests, source maps, HTML scripts, `maps_to_source` edges from parsed bundle maps, the binding layer with unused-import detection) |
 | `identify_binary_formats` | Implemented + tested (magic bytes: ELF, Mach-O 32/64/fat, PE, ZIP, gzip, PNG, JPEG, GIF, PDF, WASM, DEX, SQLite, tar; asar by structural check) |
 | `extract_strings` | Implemented + tested (ASCII printable runs, bounded, redacted) |
 | `parse_package_manifest` | Implemented + tested (tolerant `package.json`) |
-| `parse_javascript` | Implemented + tested (line-oriented heuristic scanner) |
+| `parse_javascript` | Implemented + tested (line-oriented heuristic scanner; Phase Four adds the Source Map v3 structural parser with per-segment honest degradation, and the token-level binding layer labeled `inferred` with standing caveats) |
 | `inspect_archives` | Implemented + tested (zip/jar/apk member listing, safety observations, bounded in-memory reads; asar listing) |
 | `parse_elf` | Implemented + tested (32/64-bit, both endians; header, sections, `.dynsym` undefined symbols) |
 | `parse_pe` | Implemented + tested (PE32/PE32+ headers, sections, imports/exports, .NET CLI metadata inventory) |

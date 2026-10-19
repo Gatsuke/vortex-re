@@ -40,12 +40,16 @@ degraded result must keep what already succeeded.**
       bundles) hit our line/max-file-bytes limits and produce `partial`
       runs rather than failure — covered by existing limit tests; the
       fixture now also carries a realistic minified line.
-- [ ] Fuzz-ish adversarial corpus in CI (REA's five bugs were all real-world
+- [x] Fuzz-ish adversarial corpus in CI (REA's five bugs were all real-world
       artifacts): one giant line, one deep directory tree, one pathological
-      package graph. (Backlog, Phase 2.)
-- [ ] When a semantic-analysis phase arrives (Phase 4), budget by AST-node
+      package graph. (Shipped with Phase Two; extended for archives/natives
+      in Phase Three and source maps/bindings in Phase Four.)
+- [x] When a semantic-analysis phase arrives (Phase 4), budget by AST-node
       count and degrade to syntax-only + limitation, never discard completed
-      files (the #1911 lesson).
+      files (the #1911 lesson). (Shipped with Phase Four, deliberately
+      without an AST: the binding layer stays token-level by design, and
+      budgets are bytes, segments, and statements — every degradation keeps
+      completed work and records a limitation.)
 
 ## Lesson 2: Output bounding protects the agent's context window (REA #1850, #1964, #144, #723, #1050, #1065)
 
@@ -68,8 +72,9 @@ destroying the signal. Truncation flags stayed `false` while truncating.
 - [ ] Caller-selected views over large retained results (REA #1050's design)
       — our pagination is the primitive; add facet selection when results
       grow. (Backlog, Phase 3.)
-- [ ] Keep a budget test: assert a pathological fixture's MCP response stays
-      under a fixed byte ceiling. (Backlog, Phase 2.)
+- [x] Keep a budget test: assert a pathological fixture's MCP response stays
+      under a fixed byte ceiling. (Shipped with Phase Two as the bounded-output
+      regression guard; extended by the Phase Four map/binding caps.)
 
 ## Lesson 3: Cancellation and lifecycle rigor (REA #1746, #4009, #4005, #1719, #4436)
 

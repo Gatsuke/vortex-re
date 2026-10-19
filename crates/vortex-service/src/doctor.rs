@@ -472,16 +472,16 @@ pub fn run_doctor(service: &VortexService) -> DoctorReport {
             "inspect file (identity, digest, format, bounded content analysis)".to_string(),
             "inspect directory (bounded inventory, manifests, source map references)".to_string(),
             "search literal text in text files with file:line locations".to_string(),
-            "trace relationships (imports, requires, dependencies, source maps, scripts)"
-                .to_string(),
+            "trace relationships (imports, requires, dependencies, source maps, scripts)".to_string(),
             "identify binary formats by magic bytes".to_string(),
             "extract printable strings from binary files (redacted)".to_string(),
-            "list zip/jar/apk and Electron asar archive members (read-only, bounded, in-memory)"
-                .to_string(),
+            "list zip/jar/apk and Electron asar archive members (read-only, bounded, in-memory)".to_string(),
             "parse ELF and PE/COFF structure (headers, sections, imports/exports)".to_string(),
-            "read Android DEX headers, counts, and class inventories (also inside APKs)"
-                .to_string(),
+            "read Android DEX headers, counts, and class inventories (also inside APKs)".to_string(),
             "inventory .NET assembly metadata (runtime, entry point, metadata streams)".to_string(),
+            "reconstruct source maps: parse .map documents, resolve a bundle's sourceMappingURL to a sibling map, per-source aggregates with segment ordinals as provenance, and maps_to_source edges (bundle correspondence checked textually, never verified - the format carries no checksum linkage)".to_string(),
+            "report imported bindings and their usage sites beyond import edges, including statically-unused imports (token-level, scope-unaware, labeled inferred with standing caveats)".to_string(),
+            "compare runs with dependency-change semantics: per-dependency added/removed/range-changed/section-moved with range text verbatim (no semver interpretation, ever), per-file import changes, and native symbol-level changes".to_string(),
             "persist, list, page through, export, and compare evidence runs".to_string(),
             "serve MCP tools over stdio".to_string(),
         ],
@@ -514,13 +514,39 @@ pub fn run_doctor(service: &VortexService) -> DoctorReport {
             },
             NotSupported {
                 operation: "extract archives (zip/asar)".to_string(),
-                reason: "archive extraction is not implemented in this release; members \
-                         are listed and read in memory under bounded budgets instead"
+                reason: "archive extraction is not implemented and will not be: the \
+                         Phase Three safety review concluded that bounded in-memory \
+                         member access removes the extraction attack surface entirely \
+                         instead of defending it, so members are listed and read under \
+                         caps and never written to disk"
                     .to_string(),
-                prerequisite: Some(
-                    "planned capability with explicit safety review (see docs/THREAT_MODEL.md)"
-                        .to_string(),
-                ),
+                prerequisite: None,
+            },
+            NotSupported {
+                operation: "decode inline data: URI source maps".to_string(),
+                reason: "inline maps are recorded as references with their URI and not \
+                         decoded; decode-on-demand would add a base64 decoding surface \
+                         with no test value, and the reference is preserved verbatim"
+                    .to_string(),
+                prerequisite: Some("revisit if a real artifact needs it (see docs/ROADMAP.md)".to_string()),
+            },
+            NotSupported {
+                operation: "semver interpretation of dependency range changes".to_string(),
+                reason: "comparisons report range text verbatim ('^1.2.8' -> '^2.0.0' is a \
+                         text change); interpreting it as an upgrade, downgrade, or \
+                         breaking change would be a fabricated claim no static analysis \
+                         can support"
+                    .to_string(),
+                prerequisite: None,
+            },
+            NotSupported {
+                operation: "scope-aware binding analysis (shadowing, call paths)".to_string(),
+                reason: "the binding layer is token-level by design: shadowing can both \
+                         hide and invent usages, which is disclosed in every run; \
+                         resolving it would require a JavaScript parser and would start \
+                         implying runtime behavior"
+                    .to_string(),
+                prerequisite: None,
             },
             NotSupported {
                 operation: "execute or observe the target at runtime".to_string(),
@@ -679,5 +705,53 @@ mod tests {
             .find(|n| n.operation.contains("deep DEX"))
             .expect("deep DEX boundary stays stated");
         assert!(dex.reason.contains("built-in support"));
+
+        // Phase Four: the new capabilities are advertised, and their
+        // boundaries are stated without contradicting them.
+        assert!(report
+            .supported_now
+            .iter()
+            .any(|s| s.contains("reconstruct source maps")));
+        assert!(report
+            .supported_now
+            .iter()
+            .any(|s| s.contains("imported bindings")));
+        assert!(report
+            .supported_now
+            .iter()
+            .any(|s| s.contains("dependency-change semantics")));
+
+        // The sourcemap entry never claims bundle correspondence is
+        // verified — the format cannot support that claim.
+        assert!(report
+            .supported_now
+            .iter()
+            .any(|s| s.contains("never verified - the format carries no checksum linkage")));
+
+        // The semver entry explains the honesty rule instead of claiming
+        // a gap in capability; the binding entry does the same.
+        let semver = report
+            .not_supported
+            .iter()
+            .find(|n| n.operation.contains("semver interpretation"))
+            .expect("semver boundary stays stated");
+        assert!(semver.reason.contains("fabricated claim"));
+        assert!(!semver.prerequisite.is_some());
+        let scope = report
+            .not_supported
+            .iter()
+            .find(|n| n.operation.contains("scope-aware binding"))
+            .expect("binding boundary stays stated");
+        assert!(scope.reason.contains("disclosed in every run"));
+
+        // The archive extraction entry states the by-design decision (the
+        // review concluded no-extraction), not a pending review.
+        let archive = report
+            .not_supported
+            .iter()
+            .find(|n| n.operation.contains("extract archives"))
+            .expect("archive boundary stays stated");
+        assert!(archive.reason.contains("will not be"));
+        assert!(!archive.reason.contains("deliberately deferred"));
     }
 }

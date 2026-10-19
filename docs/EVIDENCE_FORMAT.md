@@ -102,9 +102,11 @@ of the complete tree.
   specifier to a path; classifying a manifest as Electron because it
   declares the `electron` dependency; "entry point" from `package.json`
   `main`).
-* **inferred** — a hypothesis that still needs verification. The current
-  built-in provider emits none; the classification exists so future
-  providers can mark guesses honestly. An `inferred` finding without a
+* **inferred** — a hypothesis that still needs verification. The
+  built-in provider emits these for the Phase Four binding layer
+  (token-level, scope-unaware usage sites and unused-import
+  conclusions); every one of them carries its caveat in `details`
+  and a matching limitation on the run. An `inferred` finding without a
   matching `unknowns`/`limitations` entry is a validation smell.
 
 **No confidence percentages.** There is no defensible measurement method
@@ -120,7 +122,10 @@ behind such numbers, so the format does not carry them.
 | `imports_summary` | observed | Per-file import census; raw refs (specifier, line, column, syntax) in `details` |
 | `sourcemap_reference` | observed | A `sourceMappingURL` comment (file:line:column + target URL) |
 | `json_document` | observed | Valid JSON with top-level key census |
-| `sourcemap_file` | observed | A `.map` document with `version` + `mappings` |
+| `sourcemap_document` | observed | A parsed `.map`: version, file/sourceRoot, sources and names listings (exact totals), sourcesContent measured by presence and byte length, segment accounting by exact reason |
+| `sourcemap_reconstruction` | derived | What the map maps: per-source aggregates with first/last mappings and segment ordinals as provenance, sample segments verbatim, coverage vs the bundle's line count when paired, and the `file`-field correspondence check |
+| `binding_references` | inferred | Imported bindings (ESM and CJS shapes) and their usage sites (call/member/reexport/bare) with line:column locations; scope-unaware by design and labeled so |
+| `unused_import_binding` | inferred | Bindings with zero usage sites outside their declaration — the statically-unused imports — with the shadowing caveat spelled out |
 | `package_manifest` | observed | Parsed `package.json` facts (name, version, main, deps, ...) |
 | `entry_point` | derived | Entry point derived from a manifest `main`/`module` field |
 | `classification` | derived | Electron classification derived from manifest dependency declarations |
@@ -156,7 +161,7 @@ limitations with reasons, never as absent.
 | --- | --- | --- |
 | `id` | string | `r1`, `r2`, ... |
 | `from` / `to` | object | `{ kind, id }` — `kind` is `file`, `package`, `external_package`, `builtin`, `data_uri`, or `external_resource`; `id` is a root-relative path, package name, or builtin name |
-| `kind` | string | `imports` \| `exports_from` \| `requires` \| `dynamic_import` \| `declares_dependency` \| `references_sourcemap` \| `references_script` |
+| `kind` | string | `imports` \| `exports_from` \| `requires` \| `dynamic_import` \| `declares_dependency` \| `references_sourcemap` \| `references_script` \| `maps_to_source` |
 | `scope` | string | `internal` (both endpoints inside the root) or `external` |
 | `status` | string | `resolved` \| `unresolved` \| `inline` |
 | `resolution_note` | string? | Required whenever `status` is `unresolved`: why (missing file, not installed, builtin, outside root, ...) |
@@ -174,6 +179,34 @@ Semantics worth internalizing:
   (undeclared bare imports) also produce an `unknowns` entry.
 * Unresolved local references always carry the resolution attempts in
   `resolution_note` (for example, `tried: ./x, ./x.js, ./x.json, ./x/index.js`).
+* `maps_to_source` edges are **derived** from a bundle's source map: they
+  restate what the map declares about the bundle's build-time inputs,
+  resolved on disk when possible. They are not verified runtime
+  relationships, and runs say so in `limitations`.
+
+## Comparison output (`vortex compare`)
+
+Comparisons are computed at read time from stored runs; they are not
+part of the persisted record. The output carries:
+
+* `findings_only_in_a/b`, `relationships_only_in_a/b` — multiset presence
+  diffs, bounded to 100 entries per bucket with exact `totals`.
+* `semantic_changes` (Phase Four) — what changed *inside* matched
+  findings, computed over the recorded evidence only:
+  * `manifest_dependency_changes`: added / removed / `range_changed` /
+    `section_moved`, every range string verbatim. No semver interpretation
+    is ever applied — a changed range text is never called an upgrade,
+    downgrade, or breaking change.
+  * `manifests_only_in_a/b`: manifests present in one run only, explicitly
+    *not* enumerated per package (the whole declaration set is new or
+    absent).
+  * `import_changes` per file, `native_symbol_changes` per file
+    (symbols, exports, DLLs and per-DLL functions), and `sourcemap_changes`
+    as `field: a -> b` text — all informational.
+* `notes` — always led by the structural-only disclaimer; when anything
+  semantic changed, a second note states that semantic changes describe
+  recorded declarations and structure as text, with no behavioral
+  meaning and no equivalence claim. Identical runs add no note at all.
 
 ## Storage, export, deletion
 

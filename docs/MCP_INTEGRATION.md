@@ -65,7 +65,10 @@ aspirational):
   `pagination` object tells the agent how to fetch more with
   `vortex_read_evidence` instead of re-running analysis.
 * Every list in output is bounded, and truncation is reported in
-  `counts.truncated` and `limitations`.
+  `counts.truncated` and `limitations`. The Phase Four findings (source
+  map reconstruction, binding references) flow through the same response
+  budgets and item caps as everything else — no new unbounded surface
+  was added.
 * Agents should treat `unknowns` as questions to investigate, not as
   findings.
 

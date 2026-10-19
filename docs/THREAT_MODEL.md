@@ -175,6 +175,23 @@ filename encoding to normalize. This is stronger than sanitizing an
 extraction step, and it is the reasoning the roadmap's "hard safety review"
 gate asked for.
 
+### 9. Source map and binding analysis (Phase Four, shipped)
+
+Phase Four parses attacker-controlled source map JSON and scans for
+imported-binding usage sites. The hazards considered, and the decisions:
+
+| Hazard | Decision |
+| --- | --- |
+| Malicious map JSON (huge strings, deep nesting) | Maps above `max_sourcemap_bytes` (16 MiB default) are refused, not half-parsed; reads are capped by that budget and the run byte budget; a truncated read is disclosed as unparseable. |
+| `mappings` string crafted to exhaust decode time or memory | Segment decoding stops at `max_sourcemap_segments` (100k default) with the stop reason recorded and the true count disclosed as "at least N"; VLQ values beyond the format's expressible range are rejected, never trusted for allocation. |
+| Out-of-range / negative / out-of-order coordinates | Each unusable segment is kept in the line structure, counted by exact reason, and maps nothing — never silently dropped, never corrected into a plausible mapping. |
+| `sourcesContent` as an exfiltration/echo vector | Embedded contents are measured by presence and byte length only; the bytes are never reproduced into evidence, so a map cannot use `vortex` to echo payloads. |
+| `sourceMappingURL` pointing outside the root | Resolved through the same confinement-checked resolver as every other reference; escapes are rejected and disclosed, `data:` URIs are recorded but not decoded. |
+| Path claims in `sources[]` (absolute, `..`, URL) | Joined through `sourceRoot` then resolved inside the root only; escapes become external unresolved edges with the reason, never file reads. |
+| False certainty about bundle-map correspondence | The format has no checksum linkage; correspondence is checked textually against the `file` field (matches/mismatch/absent) and every reconstruction carries the standing "cannot verify this map was generated from this exact bundle" limitation. |
+| Binding scan false positives (the security-relevant kind) | The usage-site scan is token-level and scope-unaware by design; a shadowed same-name declaration counts as a usage and shadowing can hide real ones. This is disclosed in every run and in every finding's caveat — the layer can over-report references, and it says so. |
+| Commented-out code counted as usage | Comments are not stripped (pre-existing scanner rule); the binding tests pin a comment being counted, and the limitation says so. |
+
 ## Explicit non-goals
 
 * **This is not a sandbox.** "Static analysis only" means the analyzed

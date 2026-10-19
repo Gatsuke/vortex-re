@@ -127,19 +127,53 @@ archive members; directory inspection lists native binaries but deep
 structural parsing is single-file inspection; the SQLite `RunStore`
 remains deliberately open from Phase Two.
 
-## Phase Four — deeper investigation
+## Phase Four — deeper investigation (shipped)
 
 **Goal**: answer harder questions about supported artifacts.
 
-- [ ] Source map reconstruction (mapping bundle positions back to sources).
-- [ ] Call-graph refinement beyond import edges (with explicit "static
-      reference, not runtime path" framing).
-- [ ] Version-to-version structural comparison improvements (semantics of
-      dependency changes, not just presence).
+- [x] Source map reconstruction (mapping bundle positions back to
+      sources). Shipped as: a dedicated Source Map v3 parser
+      (`crates/vortex-providers/src/javascript/sourcemap.rs`) with the
+      exact revision-3 continuation semantics, per-segment honest
+      degradation, and exact error accounting; structural
+      `sourcemap_document` findings for directly inspected maps;
+      bundle-paired `sourcemap_reconstruction` findings carrying
+      per-mapping provenance (segment ordinals, map identity) and the
+      `file`-field correspondence check; and `maps_to_source`
+      relationship edges resolved on disk through `sourceRoot`-aware
+      joining.
+- [x] Call-graph refinement beyond import edges (with explicit
+      "static reference, not runtime path" framing). Shipped as: the
+      binding layer (`scan_import_bindings` + `scan_binding_usages`,
+      token-level and scope-unaware, labeled `inferred` with standing
+      caveats), reporting every binding an import introduces and every
+      usage site outside its declaration span, plus the
+      statically-unused imports with the shadowing caveat.
+- [x] Version-to-version structural comparison improvements (semantics
+      of dependency changes, not just presence). Shipped as: the
+      `semantic_changes` layer on `vortex compare` — per-dependency
+      added/removed/range-changed/section-moved with every range
+      string verbatim (no semver interpretation, ever), per-file import
+      declaration changes, ELF/PE symbol-level changes, and source map
+      count changes as text.
 
-**Acceptance**: reconstruction results carry per-mapping provenance and
-error rates; comparisons never claim behavioral equivalence without a
-verification method.
+**Acceptance** (met): reconstruction results carry per-mapping
+provenance — every mapping cites its segment ordinal in the map's
+`mappings` string and the map's own identity (path, SHA-256, size) —
+and honest error accounting instead of fabricated error rates: exact
+per-reason counts of unusable segments, exact coverage statistics
+(spanned lines, mapped lines, bundle line count), and the standing
+disclosure that the format carries no checksum linkage, so
+bundle-map correspondence is never verified, only checked textually
+against the `file` field. Comparisons never claim behavioral
+equivalence without a verification method — the standing note says
+recorded declarations and structure as text, and a test asserts the
+words upgrade/downgrade/breaking never appear in the serialized layer.
+
+Known limitations (documented, tracked below): source map
+reconstruction does not enter archive members; binding analysis is
+scope-unaware by design (disclosed); semver interpretation of range
+changes is deliberately absent.
 
 ## Phase Five — controlled dynamic analysis
 
