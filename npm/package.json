@@ -1,6 +1,6 @@
 {
   "name": "vortex-re",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local-first, AI-oriented reverse-engineering toolkit: evidence-backed static analysis of software you are authorized to inspect, with CLI and MCP interfaces. Inspected targets are never executed.",
   "keywords": [
     "reverse-engineering",
