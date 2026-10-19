@@ -1015,6 +1015,15 @@ fn search_file_target(
     if session.add_file(&rel_path, &content) {
         let mut remaining = ctx.limits().max_matches;
         record_new_matches(builder, session.matches(), &mut remaining);
+        if session.is_truncated() {
+            // Honesty rule: a truncated search is a partial result, and the
+            // truncation is visible in the report, not just the summary.
+            builder.limitation(format!(
+                "search stopped at {} matches (limit); additional matches may exist in {rel_path}",
+                ctx.limits().max_matches
+            ));
+            builder.force_partial("search output truncated by the match limit");
+        }
         summarize_search(&session, 1, 0, &display_path)
     } else {
         builder.skipped();
@@ -1100,6 +1109,10 @@ fn search_directory(
         builder.limitation(format!(
             "{files_skipped_binary} binary file(s) were skipped by literal search"
         ));
+    }
+    if truncated_by_global || session.is_truncated() {
+        // The summary says it; the report outcome must say it too.
+        builder.force_partial("search output truncated by the match limit");
     }
     let mut summary = summarize_search(
         &session,
@@ -1319,6 +1332,14 @@ fn relationships_impl(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde
                 }
             }
         }
+    }
+
+    if manifests.len() >= MAX_MANIFESTS {
+        builder.limitation(format!(
+            "manifest parsing stopped at {MAX_MANIFESTS} manifests (limit); manifests beyond the \
+             cap were not parsed, so 'not declared in any inspected package.json' notes for \
+             their dependencies may be wrong — those manifests were never read"
+        ));
     }
 
     // Phase 2: per-file scanning.
