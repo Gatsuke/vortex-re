@@ -343,6 +343,512 @@ fn find_attribute(tag: &str, attribute: &str) -> Option<usize> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// imported bindings and their usage sites (Phase Four)
+// ---------------------------------------------------------------------------
+
+/// How a binding was introduced by an import-like statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingRole {
+    /// `import X from 'y'` or `const X = require('y')`.
+    Default,
+    /// A named import (`import { a } from 'y'`, aliases included) or a
+    /// destructured require (`const { a } = require('y')`).
+    Named,
+    /// `import * as ns from 'y'`.
+    Namespace,
+    /// `const x = require('y').prop` (the binding is a member of the module).
+    MemberOf,
+}
+
+impl BindingRole {
+    /// Stable identifier used in findings.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BindingRole::Default => "default",
+            BindingRole::Named => "named",
+            BindingRole::Namespace => "namespace",
+            BindingRole::MemberOf => "member_of",
+        }
+    }
+}
+
+/// One binding introduced by an import-like statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedBinding {
+    /// The local binding name.
+    pub name: String,
+    /// How it was introduced.
+    pub role: BindingRole,
+    /// 1-based line of the introducing statement's start.
+    pub line: u32,
+}
+
+/// One import-like statement, its span, and the bindings it introduces.
+///
+/// Statements that introduce no bindings (side-effect imports, bare
+/// `require(...)` calls, dynamic imports, re-exports) are not returned:
+/// the binding layer is about named bindings only. Statements whose shape
+/// was not fully understood carry `unparsed = true` and whatever bindings
+/// could be read safely — never a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportBindings {
+    /// The statement syntax (import / require).
+    pub syntax: ImportSyntax,
+    /// The module specifier.
+    pub specifier: String,
+    /// 1-based line where the statement starts.
+    pub start_line: u32,
+    /// 1-based line where the statement ends (the `from` line for
+    /// multi-line imports, otherwise the same as `start_line`).
+    pub end_line: u32,
+    /// Bindings introduced (may be empty for unparseable shapes).
+    pub bindings: Vec<ImportedBinding>,
+    /// Whether any part of the statement was not understood.
+    pub unparsed: bool,
+}
+
+/// What a usage site looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageForm {
+    /// `name(` — a call-shaped reference.
+    Call,
+    /// `name.` — a member access.
+    Member,
+    /// Inside an `export { ... }` list (a re-export of the binding).
+    Reexport,
+    /// A bare identifier reference.
+    Bare,
+}
+
+impl UsageForm {
+    /// Stable identifier used in findings.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            UsageForm::Call => "call",
+            UsageForm::Member => "member",
+            UsageForm::Reexport => "reexport",
+            UsageForm::Bare => "bare",
+        }
+    }
+}
+
+/// One usage site of an imported binding outside its declaration span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingUsage {
+    /// The binding name (as introduced).
+    pub name: String,
+    /// The shape of the reference.
+    pub form: UsageForm,
+    /// 1-based line.
+    pub line: u32,
+    /// 1-based byte column of the name.
+    pub column: u32,
+}
+
+fn is_plain_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'$')
+        && text.bytes().all(is_ident_byte)
+}
+
+/// Parse the binding list of an ESM import segment (the text between
+/// `import` and `from`): default, comma, braced names, `* as ns`.
+fn parse_esm_bindings(
+    segment: &str,
+    line: u32,
+    bindings: &mut Vec<ImportedBinding>,
+    unparsed: &mut bool,
+) {
+    let segment = segment.trim().trim_end_matches(',').trim();
+    if segment.is_empty() {
+        return;
+    }
+    // `* as ns`
+    if let Some(rest) = segment.strip_prefix("* as ") {
+        let rest = rest.trim();
+        if is_plain_identifier(rest) {
+            bindings.push(ImportedBinding {
+                name: rest.to_string(),
+                role: BindingRole::Namespace,
+                line,
+            });
+            return;
+        }
+        *unparsed = true;
+        return;
+    }
+    let (head, braced) = match segment.find('{') {
+        Some(brace_at) => {
+            // Trim first, then drop a trailing comma: the reverse order
+            // leaves the comma behind when a space follows it.
+            let head = segment[..brace_at].trim().trim_end_matches(',').trim();
+            let rest = &segment[brace_at..];
+            let Some(close) = rest.rfind('}') else {
+                *unparsed = true;
+                return;
+            };
+            if !rest[close + 1..].trim().is_empty() {
+                *unparsed = true;
+            }
+            (head, &rest[1..close])
+        }
+        None => (segment, ""),
+    };
+    if !head.is_empty() {
+        if is_plain_identifier(head) {
+            bindings.push(ImportedBinding {
+                name: head.to_string(),
+                role: BindingRole::Default,
+                line,
+            });
+        } else {
+            // Includes `x, * as ns` composites and anything unrecognized.
+            *unparsed = true;
+        }
+    }
+    for item in braced.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if let Some((_, alias)) = item.split_once(" as ") {
+            let alias = alias.trim();
+            if is_plain_identifier(alias) {
+                bindings.push(ImportedBinding {
+                    name: alias.to_string(),
+                    role: BindingRole::Named,
+                    line,
+                });
+            } else {
+                *unparsed = true;
+            }
+        } else if is_plain_identifier(item) {
+            bindings.push(ImportedBinding {
+                name: item.to_string(),
+                role: BindingRole::Named,
+                line,
+            });
+        } else {
+            // Nested patterns, computed keys, defaults inside braces.
+            *unparsed = true;
+        }
+    }
+}
+
+/// Parse a CJS declaration pattern (between the keyword and `=`).
+fn parse_cjs_pattern(
+    pattern: &str,
+    line: u32,
+    bindings: &mut Vec<ImportedBinding>,
+    unparsed: &mut bool,
+    member_of: bool,
+) {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        *unparsed = true;
+        return;
+    }
+    if pattern.starts_with('{') && pattern.ends_with('}') {
+        for item in pattern[1..pattern.len() - 1].split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if let Some((_, alias)) = item.split_once(':') {
+                // `a: b` binds b to the property a.
+                let alias = alias.trim();
+                if is_plain_identifier(alias) {
+                    bindings.push(ImportedBinding {
+                        name: alias.to_string(),
+                        role: BindingRole::Named,
+                        line,
+                    });
+                } else {
+                    *unparsed = true;
+                }
+            } else if is_plain_identifier(item) {
+                bindings.push(ImportedBinding {
+                    name: item.to_string(),
+                    role: BindingRole::Named,
+                    line,
+                });
+            } else {
+                *unparsed = true;
+            }
+        }
+        return;
+    }
+    if is_plain_identifier(pattern) {
+        bindings.push(ImportedBinding {
+            name: pattern.to_string(),
+            role: if member_of {
+                BindingRole::MemberOf
+            } else {
+                BindingRole::Default
+            },
+            line,
+        });
+        return;
+    }
+    *unparsed = true;
+}
+
+/// Scan import-like statements for the bindings they introduce.
+///
+/// Line-oriented like the rest of this module: no scope analysis, no
+/// evaluation. Shapes that are not understood are counted through
+/// `unparsed` flags on the returned statements — never guessed.
+pub fn scan_import_bindings(content: &str, max: usize) -> (Vec<ImportBindings>, bool) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out: Vec<ImportBindings> = Vec::new();
+    let mut truncated = false;
+    let mut index = 0usize;
+    while index < lines.len() {
+        if out.len() >= max {
+            truncated = true;
+            break;
+        }
+        let line = lines[index];
+        let line_no = index as u32 + 1;
+        let trimmed = line.trim_start();
+
+        // ---- ESM import statements (possibly spanning lines) ----
+        if trimmed.starts_with("import ") || trimmed.starts_with("import'") {
+            let has_from = line.contains(" from ");
+            let quotes = quoted_strings(line);
+            if has_from && quotes.last().is_some() {
+                // Single-line import statement.
+                let specifier = quotes.last().map(|(s, _)| s.clone()).unwrap_or_default();
+                let import_at = line.find("import").unwrap_or(0);
+                let from_at = line.find(" from ").unwrap_or(line.len());
+                let segment = &line[import_at + "import".len()..from_at];
+                let mut bindings = Vec::new();
+                let mut unparsed = false;
+                parse_esm_bindings(segment, line_no, &mut bindings, &mut unparsed);
+                out.push(ImportBindings {
+                    syntax: ImportSyntax::Import,
+                    specifier,
+                    start_line: line_no,
+                    end_line: line_no,
+                    bindings,
+                    unparsed,
+                });
+                index += 1;
+                continue;
+            }
+            if !has_from && quotes.last().is_some() {
+                // Side-effect import `import 'y'` — no bindings to report.
+                index += 1;
+                continue;
+            }
+            // Multi-line import: consume until the `from` line.
+            let mut end = index;
+            let mut joined = String::from(trimmed);
+            let mut found_from = false;
+            while end + 1 < lines.len() {
+                end += 1;
+                let next = lines[end];
+                joined.push(' ');
+                joined.push_str(next.trim());
+                if next.contains(" from ") && quoted_strings(next).last().is_some() {
+                    found_from = true;
+                    break;
+                }
+                if next.trim().is_empty()
+                    || next.trim_start().starts_with("import")
+                    || next.trim_start().starts_with("const ")
+                {
+                    // Malformed or a new statement: stop, mark unparsed.
+                    break;
+                }
+            }
+            if found_from {
+                let next = lines[end];
+                let specifier = quoted_strings(next)
+                    .last()
+                    .map(|(s, _)| s.clone())
+                    .unwrap_or_default();
+                let from_at = joined.find(" from ").unwrap_or(joined.len());
+                let segment = &joined["import".len()..from_at];
+                let mut bindings = Vec::new();
+                let mut unparsed = false;
+                parse_esm_bindings(segment, line_no, &mut bindings, &mut unparsed);
+                out.push(ImportBindings {
+                    syntax: ImportSyntax::Import,
+                    specifier,
+                    start_line: line_no,
+                    end_line: end as u32 + 1,
+                    bindings,
+                    unparsed,
+                });
+                index = end + 1;
+                continue;
+            }
+            // A dangling import without a from: not a binding statement we
+            // understand (or a plain `import x` type error).
+            out.push(ImportBindings {
+                syntax: ImportSyntax::Import,
+                specifier: String::new(),
+                start_line: line_no,
+                end_line: line_no,
+                bindings: Vec::new(),
+                unparsed: true,
+            });
+            index += 1;
+            continue;
+        }
+
+        // ---- CJS declarations: const/let/var <pattern> = require('y') ----
+        let decl_keyword = ["const ", "let ", "var "]
+            .iter()
+            .find(|kw| trimmed.starts_with(**kw))
+            .copied();
+        if let Some(keyword) = decl_keyword {
+            // The first '=' in a declaration line is the assignment (a
+            // pattern with a default would slice short and land in
+            // `unparsed` instead — the honest outcome).
+            if let Some(eq_at) = trimmed.find('=') {
+                let pattern = trimmed[keyword.len()..eq_at].trim();
+                if let Some(req_at) = line.match_indices("require").next().map(|(at, _)| at) {
+                    if word_boundary(line, req_at, "require") {
+                        if let Some((specifier, quote_col)) =
+                            quoted_after_separator(line, req_at + "require".len(), b'(')
+                        {
+                            // What follows the closing quote: ')', then
+                            // either EOL/';' (plain require) or '.member'
+                            // chains (member binding); anything else
+                            // (comma, operator) -> unparsed tail.
+                            let after_quote = &line[quote_col as usize + specifier.len() + 1..];
+                            let after_quote_trim = after_quote.trim_start();
+                            let mut member_of = false;
+                            let mut tail_ok = after_quote_trim.starts_with(')');
+                            if tail_ok {
+                                let mut tail = after_quote_trim[1..].trim_start();
+                                let mut member_count = 0usize;
+                                while tail.starts_with('.') {
+                                    let rest = &tail[1..];
+                                    let ident_end = rest
+                                        .find(|c: char| {
+                                            !(c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                                        })
+                                        .unwrap_or(rest.len());
+                                    if ident_end == 0 {
+                                        tail_ok = false;
+                                        break;
+                                    }
+                                    member_count += 1;
+                                    tail = rest[ident_end..].trim_start();
+                                }
+                                member_of = member_count > 0;
+                                if !tail.is_empty()
+                                    && !tail.starts_with(';')
+                                    && !tail.starts_with("//")
+                                {
+                                    // Multiple declarators or operators.
+                                    tail_ok = false;
+                                }
+                            }
+                            let mut bindings = Vec::new();
+                            let mut unparsed = !tail_ok;
+                            parse_cjs_pattern(
+                                pattern,
+                                line_no,
+                                &mut bindings,
+                                &mut unparsed,
+                                member_of,
+                            );
+                            out.push(ImportBindings {
+                                syntax: ImportSyntax::Require,
+                                specifier,
+                                start_line: line_no,
+                                end_line: line_no,
+                                bindings,
+                                unparsed,
+                            });
+                            index += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    (out, truncated)
+}
+
+/// Scan usage sites of the given bindings, excluding every declaration
+/// span. Token-level and scope-unaware by design: shadowed identifiers of
+/// the same name count as usages, which is why every consumer must label
+/// the results as inferred.
+///
+/// Bindings that share a name are scanned once (by name): their usage
+/// sites are attributed to every binding of that name, and the disclosure
+/// responsibility sits with the caller.
+pub fn scan_binding_usages(
+    content: &str,
+    statements: &[ImportBindings],
+    max: usize,
+) -> (Vec<BindingUsage>, bool) {
+    // Unique names in first-seen order.
+    let mut names: Vec<String> = Vec::new();
+    for statement in statements {
+        for binding in &statement.bindings {
+            if !names.iter().any(|n| n == &binding.name) {
+                names.push(binding.name.clone());
+            }
+        }
+    }
+    if names.is_empty() {
+        return (Vec::new(), false);
+    }
+    let mut out = Vec::new();
+    'lines: for (index, line) in content.lines().enumerate() {
+        let line_no = index as u32 + 1;
+        // Skip lines inside any declaration span.
+        for statement in statements {
+            if line_no >= statement.start_line && line_no <= statement.end_line {
+                continue 'lines;
+            }
+        }
+        let trimmed = line.trim_start();
+        let is_reexport_line = trimmed.starts_with("export{") || trimmed.starts_with("export {");
+        for name in &names {
+            for (position, _) in line.match_indices(name.as_str()) {
+                if !word_boundary(line, position, name) {
+                    continue;
+                }
+                if out.len() >= max {
+                    return (out, true);
+                }
+                let after = position + name.len();
+                let rest = &line[after..];
+                let rest_trim = rest.trim_start();
+                let form = if rest_trim.starts_with('(') {
+                    UsageForm::Call
+                } else if rest_trim.starts_with('.') {
+                    UsageForm::Member
+                } else if is_reexport_line {
+                    UsageForm::Reexport
+                } else {
+                    UsageForm::Bare
+                };
+                out.push(BindingUsage {
+                    name: name.clone(),
+                    form,
+                    line: line_no,
+                    column: position as u32 + 1,
+                });
+            }
+        }
+    }
+    (out, false)
+}
+
 /// Detect observed module system signals.
 pub fn detect_module_systems(content: &str) -> Vec<ModuleSystem> {
     let mut systems = Vec::new();
@@ -366,6 +872,137 @@ pub fn detect_module_systems(content: &str) -> Vec<ModuleSystem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_scan_esm_shapes() {
+        let source = "import x from './y.js';\n\
+                      import { a, b as renamed } from \"./z\";\n\
+                      import * as ns from './w';\n\
+                      import def, { extra } from './both';\n\
+                      import './side-effect';\n\
+                      export { helper } from './re.js';\n";
+        let (statements, truncated) = scan_import_bindings(source, 100);
+        assert!(!truncated);
+        // Side-effect import and export-from introduce no bindings and are
+        // not binding statements.
+        assert_eq!(statements.len(), 4);
+        assert_eq!(statements[0].specifier, "./y.js");
+        assert_eq!(statements[0].bindings.len(), 1);
+        assert_eq!(statements[0].bindings[0].name, "x");
+        assert_eq!(statements[0].bindings[0].role, BindingRole::Default);
+        assert_eq!(statements[1].bindings.len(), 2);
+        assert_eq!(statements[1].bindings[0].name, "a");
+        assert_eq!(statements[1].bindings[1].name, "renamed");
+        assert_eq!(statements[2].bindings[0].role, BindingRole::Namespace);
+        assert_eq!(statements[3].bindings.len(), 2);
+        assert_eq!(statements[3].bindings[0].name, "def");
+        assert_eq!(statements[3].bindings[1].name, "extra");
+        for statement in &statements {
+            assert!(!statement.unparsed, "unexpected unparsed: {statement:?}");
+        }
+    }
+
+    #[test]
+    fn binding_scan_multiline_span_is_recorded() {
+        let source =
+            "import {\n  one,\n  two as duo,\n} from './multi.js';\nconsole.log(one, duo);\n";
+        let (statements, _) = scan_import_bindings(source, 100);
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0].start_line, 1);
+        assert_eq!(statements[0].end_line, 4);
+        assert_eq!(statements[0].specifier, "./multi.js");
+        assert_eq!(statements[0].bindings.len(), 2);
+        assert_eq!(statements[0].bindings[1].name, "duo");
+        // Usage sites on lines 1-4 are excluded; line 5 is a usage.
+        let (usages, _) = scan_binding_usages(source, &statements, 100);
+        assert_eq!(usages.len(), 2);
+        assert_eq!(usages[0].line, 5);
+        assert_eq!(usages[0].name, "one");
+        assert_eq!(usages[1].name, "duo");
+    }
+
+    #[test]
+    fn binding_scan_cjs_shapes() {
+        let source = "const fs = require('fs');\n\
+                      const { load, save: write } = require('./store');\n\
+                      let format = require('util').format;\n\
+                      var single = require('./single');\n\
+                      const a = require('./multi'), b = 2;\n\
+                      const { nested: { deep } } = require('./nested');\n\
+                      require('./bare');\n\
+                      const noassign = 'not a require';\n";
+        let (statements, _) = scan_import_bindings(source, 100);
+        assert_eq!(statements.len(), 6);
+        assert_eq!(statements[0].bindings[0].name, "fs");
+        assert_eq!(statements[0].bindings[0].role, BindingRole::Default);
+        assert_eq!(statements[1].bindings.len(), 2);
+        assert_eq!(statements[1].bindings[0].name, "load");
+        assert_eq!(statements[1].bindings[1].name, "write");
+        assert_eq!(statements[1].bindings[1].role, BindingRole::Named);
+        assert_eq!(statements[2].bindings[0].name, "format");
+        assert_eq!(statements[2].bindings[0].role, BindingRole::MemberOf);
+        assert_eq!(statements[3].bindings[0].name, "single");
+        // Multiple declarators: the tail is not understood.
+        assert!(statements[4].unparsed);
+        assert_eq!(
+            statements[4].bindings.len(),
+            1,
+            "the first declarator's binding is kept"
+        );
+        // Nested pattern: nothing claimed, disclosed.
+        assert!(statements[5].unparsed);
+        assert!(statements[5].bindings.is_empty());
+    }
+
+    #[test]
+    fn binding_usages_forms_and_exclusions() {
+        let source = "const { load } = require('./lib');\n\
+                      const pkg = require('./pkg');\n\
+                      // a comment mentioning load, still counts (comments are not stripped)\n\
+                      const result = load('x');\n\
+                      const rest = pkg.metadata;\n\
+                      export { load as loadLib } from './re.js';\n\
+                      function unrelated(loadX) { return loadX; }\n";
+        let (statements, _) = scan_import_bindings(source, 100);
+        let (usages, _) = scan_binding_usages(source, &statements, 100);
+        let by_name = |name: &str| -> Vec<BindingUsage> {
+            usages.iter().filter(|u| u.name == name).cloned().collect()
+        };
+        // `load`: line 3 comment (bare), line 4 call, line 6 reexport.
+        // Line 2's `pkg.metadata` is a Member for pkg.
+        let load_usages = by_name("load");
+        assert_eq!(load_usages.len(), 3, "{load_usages:?}");
+        assert!(load_usages
+            .iter()
+            .any(|u| u.form == UsageForm::Bare && u.line == 3));
+        assert!(load_usages
+            .iter()
+            .any(|u| u.form == UsageForm::Call && u.line == 4));
+        assert!(load_usages
+            .iter()
+            .any(|u| u.form == UsageForm::Reexport && u.line == 6));
+        // `pkg`: member on line 5 only (the declaration on line 2 excluded).
+        let pkg_usages = by_name("pkg");
+        assert_eq!(pkg_usages.len(), 1);
+        assert_eq!(pkg_usages[0].form, UsageForm::Member);
+        assert_eq!(pkg_usages[0].line, 5);
+        // `loadX` is a different identifier: word boundaries hold.
+        assert!(by_name("loadX").is_empty());
+    }
+
+    #[test]
+    fn binding_scan_caps() {
+        let source = "import a1 from './1';\nimport a2 from './2';\nimport a3 from './3';\n";
+        let (statements, truncated) = scan_import_bindings(source, 2);
+        assert!(truncated);
+        assert_eq!(statements.len(), 2);
+
+        let usage_source = "const u = require('./u');\nu(); u(); u();\n";
+        let (stmts, _) = scan_import_bindings(usage_source, 10);
+        let (usages, truncated) = scan_binding_usages(usage_source, &stmts, 2);
+        assert!(truncated);
+        assert_eq!(usages.len(), 2);
+    }
 
     #[test]
     fn static_imports() {

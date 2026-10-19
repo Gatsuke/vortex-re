@@ -17,8 +17,9 @@ pub use resolve::{
     resolve_specifier, Resolution, SpecifierKind,
 };
 pub use scanner::{
-    detect_module_systems, scan_imports, scan_script_sources, scan_source_map_refs, ImportRef,
-    ImportSyntax, ModuleSystem, ScriptRef, SourceMapRef,
+    detect_module_systems, scan_binding_usages, scan_import_bindings, scan_imports,
+    scan_script_sources, scan_source_map_refs, BindingRole, BindingUsage, ImportBindings,
+    ImportRef, ImportSyntax, ImportedBinding, ModuleSystem, ScriptRef, SourceMapRef, UsageForm,
 };
 pub use sourcemap::{
     parse_source_map, LookupResult, SegmentMapping, SourceMapDoc, SourceMapParseError,

@@ -27,6 +27,9 @@ pub struct ResourceLimits {
     pub max_matches_per_file: usize,
     /// Maximum import references scanned per file.
     pub max_imports_per_file: usize,
+    /// Maximum binding usage sites reported per file (Phase Four binding
+    /// layer). Exact totals are always kept; only the listing is capped.
+    pub max_binding_usages_per_file: usize,
     /// Minimum length for extracted printable strings.
     pub min_string_length: usize,
     /// Maximum length for extracted printable strings.
@@ -65,6 +68,7 @@ impl Default for ResourceLimits {
             max_matches: 100,
             max_matches_per_file: 20,
             max_imports_per_file: 200,
+            max_binding_usages_per_file: 200,
             min_string_length: 5,
             max_string_length: 256,
             max_strings_per_file: 50,
@@ -121,6 +125,9 @@ impl ResourceLimits {
         }
         if self.max_sourcemap_segments == 0 {
             problems.push("max_sourcemap_segments must be >= 1");
+        }
+        if self.max_binding_usages_per_file == 0 {
+            problems.push("max_binding_usages_per_file must be >= 1");
         }
         if self.page_size_default == 0 || self.page_size_max == 0 {
             problems.push("page sizes must be >= 1");

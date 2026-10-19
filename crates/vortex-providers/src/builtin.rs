@@ -1977,6 +1977,11 @@ fn relationships_impl(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde
         "maps_to_source edges (from bundle source maps) restate build-time declarations; \
          they are not verified runtime relationships",
     );
+    builder.limitation(
+        "binding usage sites (the Phase Four layer beyond import edges) are token-level \
+         static references: scope-unaware, so shadowing can both hide and invent usages; \
+         they never prove call execution or order",
+    );
 
     let files: Vec<(String, PathBuf, u64)> = match ctx.request.target.kind {
         vortex_core::paths::TargetKind::File => {
@@ -2174,6 +2179,8 @@ fn relationships_impl(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde
                     summary_id.as_deref(),
                 );
             }
+            // Phase Four: the binding layer beyond import edges.
+            record_binding_layer(ctx, builder, rel_path, &text, &sha256, *size);
             for map_ref in javascript::scan_source_map_refs(&text) {
                 let resolved_map = record_sourcemap_relationship(
                     builder,
@@ -2879,6 +2886,150 @@ fn agg_json(m: &javascript::sourcemap::AggMapping) -> serde_json::Value {
         "source": {"line": m.source_line, "column": m.source_col},
         "ordinal": m.ordinal,
     })
+}
+
+// ---------------------------------------------------------------------------
+// imported bindings and their usage sites (Phase Four: beyond import edges)
+// ---------------------------------------------------------------------------
+
+/// The binding layer for one JS file: which imported bindings exist and
+/// where they are referenced — token-level and scope-unaware by design, so
+/// every finding is inferred and carries the standing caveat.
+///
+/// The layer answers "which imports are statically referenced at all?"
+/// beyond the bare import edges: bindings with zero usage sites are
+/// reported separately, with the shadowing caveat spelled out.
+fn record_binding_layer(
+    ctx: &mut OpContext,
+    builder: &mut ReportBuilder,
+    rel_path: &str,
+    text: &str,
+    sha256: &str,
+    size: u64,
+) {
+    let statement_cap = ctx.limits().max_imports_per_file;
+    let (statements, statements_truncated) = javascript::scan_import_bindings(text, statement_cap);
+    if statements_truncated {
+        builder.limitation(format!(
+            "{rel_path}: binding scan stopped at {statement_cap} import statement(s) (limit); \
+             later statements were not scanned"
+        ));
+    }
+    let unparsed = statements.iter().filter(|s| s.unparsed).count();
+    if unparsed > 0 {
+        builder.limitation(format!(
+            "{rel_path}: {unparsed} binding statement(s) were not fully understood; bindings \
+             are kept only where read safely, never guessed"
+        ));
+    }
+    let usage_cap = ctx.limits().max_binding_usages_per_file;
+    let (usages, usages_truncated) = javascript::scan_binding_usages(text, &statements, usage_cap);
+    if usages_truncated {
+        builder.limitation(format!(
+            "{rel_path}: usage-site listing stopped at {usage_cap} site(s) (limit); counts \
+             above are exact only up to the cap"
+        ));
+    }
+    let total_bindings: usize = statements.iter().map(|s| s.bindings.len()).sum();
+    if total_bindings == 0 {
+        return;
+    }
+
+    let entry_cap = ctx.limits().max_entries;
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut unused: Vec<serde_json::Value> = Vec::new();
+    let mut listed = 0usize;
+    'outer: for statement in &statements {
+        for binding in &statement.bindings {
+            if listed >= entry_cap {
+                break 'outer;
+            }
+            listed += 1;
+            let sites: Vec<serde_json::Value> = usages
+                .iter()
+                .filter(|u| u.name == binding.name)
+                .take(entry_cap)
+                .map(|u| {
+                    serde_json::json!({"form": u.form.as_str(), "line": u.line, "column": u.column})
+                })
+                .collect();
+            let site_count = usages.iter().filter(|u| u.name == binding.name).count();
+            rows.push(serde_json::json!({
+                "name": binding.name,
+                "role": binding.role.as_str(),
+                "specifier": statement.specifier,
+                "import_line": binding.line,
+                "usage_count": site_count,
+                "usage_sites": sites,
+            }));
+            if site_count == 0 {
+                unused.push(serde_json::json!({
+                    "name": binding.name,
+                    "role": binding.role.as_str(),
+                    "specifier": statement.specifier,
+                    "import_line": binding.line,
+                }));
+            }
+        }
+    }
+
+    builder.finding(
+        "binding_references",
+        Origin::Inferred,
+        format!(
+            "{rel_path}: {total_bindings} imported binding(s), {} usage site(s) \
+             (token-level static references, scope-unaware)",
+            usages.len(),
+        ),
+        Some(Location::file(rel_path)),
+        Some(ArtifactRef {
+            path: rel_path.to_string(),
+            sha256: sha256.to_string(),
+            size_bytes: size,
+        }),
+        serde_json::json!({
+            "file": rel_path,
+            "bindings_total": total_bindings,
+            "bindings_listed": listed,
+            "bindings_truncated": total_bindings > listed,
+            "usages_total": usages.len(),
+            "usages_truncated": usages_truncated,
+            "unparsed_statements": unparsed,
+            "bindings": rows,
+            "framing": "usage sites are token-level static references beyond import edges; \
+                         they are not runtime paths, not evidence of calls executing, and \
+                         not scope-resolved (bindings that share a name share their sites)",
+        }),
+    );
+    if total_bindings > listed {
+        builder.limitation(format!(
+            "{rel_path}: binding listing stopped at {entry_cap} of {total_bindings} binding(s) \
+             (limit); counts are exact for the listed entries only"
+        ));
+    }
+    if !unused.is_empty() {
+        builder.finding(
+            "unused_import_binding",
+            Origin::Inferred,
+            format!(
+                "{rel_path}: {} imported binding(s) with no usage site outside their declaration",
+                unused.len(),
+            ),
+            Some(Location::file(rel_path)),
+            Some(ArtifactRef {
+                path: rel_path.to_string(),
+                sha256: sha256.to_string(),
+                size_bytes: size,
+            }),
+            serde_json::json!({
+                "file": rel_path,
+                "bindings": unused,
+                "caveat": "token-level, scope-unaware scan: a shadowed declaration of the same \
+                           name would count as a usage, and shadowing the import could hide real \
+                           usages; verify with `vortex search <name>` before concluding",
+            }),
+        );
+    }
 }
 
 /// Context for one map that is being reconstructed: where it came from and

@@ -37,6 +37,7 @@ const LIMIT_KEYS: &[&str] = &[
     "max_matches",
     "max_matches_per_file",
     "max_imports_per_file",
+    "max_binding_usages_per_file",
     "min_string_length",
     "max_string_length",
     "max_strings_per_file",
@@ -152,6 +153,8 @@ pub struct PartialLimits {
     pub max_matches_per_file: Option<usize>,
     /// See [`ResourceLimits::max_imports_per_file`].
     pub max_imports_per_file: Option<usize>,
+    /// See [`ResourceLimits::max_binding_usages_per_file`].
+    pub max_binding_usages_per_file: Option<usize>,
     /// See [`ResourceLimits::min_string_length`].
     pub min_string_length: Option<usize>,
     /// See [`ResourceLimits::max_string_length`].
@@ -242,6 +245,9 @@ impl FileConfig {
             }
             if let Some(v) = file.max_imports_per_file {
                 limits.max_imports_per_file = v;
+            }
+            if let Some(v) = file.max_binding_usages_per_file {
+                limits.max_binding_usages_per_file = v;
             }
             if let Some(v) = file.min_string_length {
                 limits.min_string_length = v;
@@ -403,6 +409,7 @@ max_entries = 14
 max_matches = 15
 max_matches_per_file = 16
 max_imports_per_file = 17
+max_binding_usages_per_file = 26
 min_string_length = 4
 max_string_length = 200
 max_strings_per_file = 18
@@ -423,6 +430,7 @@ grace_secs = 23
         assert_eq!(limits.max_files, 11);
         assert_eq!(limits.max_total_bytes, 10000);
         assert_eq!(limits.max_matches_per_file, 16);
+        assert_eq!(limits.max_binding_usages_per_file, 26);
         assert_eq!(limits.max_archive_members, 24);
         assert_eq!(limits.max_archive_member_bytes, 4096);
         assert_eq!(limits.max_sourcemap_bytes, 8192);
