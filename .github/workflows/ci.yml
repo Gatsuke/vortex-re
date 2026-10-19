@@ -89,3 +89,6 @@ jobs:
           ./target/release/vortex --version
           ./target/release/vortex doctor
           ./target/release/vortex inspect fixtures/javascript-demo --no-store
+          ./target/release/vortex inspect fixtures/native/elf64-demo --no-store
+          ./target/release/vortex inspect fixtures/native/pe64-demo.exe --no-store
+          ./target/release/vortex inspect fixtures/archives/demo.asar --no-store
