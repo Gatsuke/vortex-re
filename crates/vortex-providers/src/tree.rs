@@ -2,6 +2,10 @@
 //!
 //! Policy decisions that this walk enforces:
 //! * entries are visited in lexicographic order for reproducibility;
+//! * relative paths are built with '/' on every platform, so the same
+//!   tree yields byte-identical paths — and therefore evidence — on
+//!   Linux, macOS, and Windows alike (Windows accepts '/' when these
+//!   paths are rejoined onto a root);
 //! * symbolic links are never followed — they are recorded as skipped with
 //!   their target, because following them could read outside the inspection
 //!   root;
@@ -9,6 +13,7 @@
 //!   walk truncated rather than silently dropping entries.
 
 use crate::provider::StopReason;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use vortex_core::limits::ResourceLimits;
 
@@ -93,6 +98,22 @@ pub struct WalkResult {
     pub stop_reason: Option<StopReason>,
 }
 
+/// Join one component onto a relative path, always with '/'.
+///
+/// `PathBuf::join` would use the platform separator (`\` on Windows),
+/// which would make the same tree produce different evidence paths on
+/// different platforms. Building the string with '/' keeps paths — and
+/// the records derived from them — byte-identical everywhere, and
+/// preserves arbitrary (possibly non-UTF-8) file names via `OsString`.
+fn join_rel(rel: &Path, name: &OsStr) -> PathBuf {
+    let mut joined = rel.as_os_str().to_os_string();
+    if !joined.is_empty() {
+        joined.push("/");
+    }
+    joined.push(name);
+    joined.into()
+}
+
 /// Walk `root` deterministically within `limits`.
 ///
 /// `stop_check` is consulted between entries so walks can be cancelled or
@@ -137,7 +158,7 @@ pub fn walk(
         // Depth-first in lexicographic order: push reversed.
         for entry in children.into_iter().rev() {
             let name = entry.file_name();
-            let child_rel = rel_dir.join(&name);
+            let child_rel = join_rel(&rel_dir, &name);
             let child_abs = abs_dir.join(&name);
             // Never follow symlinks: inspect the link itself.
             let Ok(meta) = std::fs::symlink_metadata(&child_abs) else {
@@ -237,6 +258,8 @@ mod tests {
             .iter()
             .map(|f| f.rel_path.display().to_string())
             .collect();
+        // Forward slashes on every platform: identical trees must yield
+        // identical evidence paths (see join_rel).
         assert_eq!(
             paths,
             vec!["a.txt", "b.txt", "sub/deep/x.txt", "sub/inner.txt"]
