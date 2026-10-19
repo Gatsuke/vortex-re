@@ -21,7 +21,10 @@ const BOMB_RATIO: u64 = 100;
 const BOMB_MIN_SIZE: u64 = 1024 * 1024;
 /// Cap on safety observations recorded (they repeat per member; one note
 /// per distinct kind with examples is enough for evidence).
-const MAX_SAFETY_NOTES: usize = 50;
+pub const MAX_SAFETY_NOTES: usize = 50;
+/// Cap on per-member listing errors recorded; a summary line covers the
+/// rest.
+const MAX_ENTRY_ERRORS: usize = 10;
 
 /// One listed member.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,8 +96,14 @@ pub struct ZipListing {
     pub truncated: bool,
     /// Safety observations (bounded).
     pub safety: Vec<ZipSafetyNote>,
+    /// Safety observations beyond [`MAX_SAFETY_NOTES`] that were not
+    /// recorded (reported so the cap is visible, never silent).
+    pub safety_dropped: usize,
     /// Non-fatal per-member errors observed while listing.
     pub errors: Vec<String>,
+    /// Entry errors beyond [`MAX_ENTRY_ERRORS`] that were not recorded
+    /// individually (a summary line in `errors` covers them).
+    pub errors_dropped: usize,
     /// `AndroidManifest.xml` plus `classes*.dex` members were seen.
     pub looks_like_apk: bool,
 }
@@ -153,8 +162,10 @@ pub fn list(path: &Path, limits: &ResourceLimits) -> Result<ZipListing, String> 
         let entry = match archive.by_index(index) {
             Ok(entry) => entry,
             Err(err) => {
-                if listing.errors.len() < 10 {
+                if listing.errors.len() < MAX_ENTRY_ERRORS {
                     listing.errors.push(format!("entry {index}: {err}"));
+                } else {
+                    listing.errors_dropped += 1;
                 }
                 continue;
             }
@@ -254,12 +265,19 @@ pub fn list(path: &Path, limits: &ResourceLimits) -> Result<ZipListing, String> 
             is_dir,
         });
     }
+    if listing.errors_dropped > 0 {
+        listing.errors.push(format!(
+            "{} additional entry errors were suppressed (cap {MAX_ENTRY_ERRORS})",
+            listing.errors_dropped
+        ));
+    }
     listing.looks_like_apk = has_manifest && has_dex;
     Ok(listing)
 }
 
 fn push_note(listing: &mut ZipListing, kind: SafetyKind, member: &str, detail: String) {
     if listing.safety.len() >= MAX_SAFETY_NOTES {
+        listing.safety_dropped += 1;
         return;
     }
     listing.safety.push(ZipSafetyNote {
@@ -550,5 +568,25 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("capped at 3 of 10")));
+    }
+
+    #[test]
+    fn safety_note_cap_discloses_the_dropped_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("traversal.zip");
+        let mut writer = ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        // 60 traversal names: 50 notes recorded, 10 dropped and counted.
+        for i in 0..60 {
+            writer
+                .start_file(format!("../evil{i}.txt"), stored())
+                .unwrap();
+            writer.write_all(b"x").unwrap();
+        }
+        writer.finish().unwrap();
+        let listing = list(&zip_path, &limits_with(1024)).unwrap();
+        assert_eq!(listing.total_members, 60);
+        assert_eq!(listing.safety.len(), MAX_SAFETY_NOTES);
+        assert_eq!(listing.safety_dropped, 10);
+        assert!(listing.errors.is_empty());
     }
 }

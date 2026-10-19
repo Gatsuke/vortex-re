@@ -16,6 +16,9 @@ use time::format_description::well_known::Rfc3339;
 pub const MAX_SECTIONS: usize = 4096;
 pub const MAX_IMPORT_DLLS: usize = 1024;
 pub const MAX_EXPORT_NAMES: usize = 10_000;
+/// Thunks enumerated per imported DLL. Hitting the cap is recorded on the
+/// DLL row (`thunk_cap_hit`) instead of silently truncating.
+pub const MAX_THUNKS_PER_DLL: usize = 10_000;
 
 /// One section-table row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +47,10 @@ pub struct PeImportDll {
     pub functions: Vec<String>,
     /// Imports by ordinal (no name available).
     pub ordinal_count: usize,
+    /// True when the DLL's thunk array held more than
+    /// [`MAX_THUNKS_PER_DLL`] entries; counts stay exact, the name list
+    /// stopped at the cap.
+    pub thunk_cap_hit: bool,
 }
 
 /// The .NET PE/CLI metadata inventory.
@@ -327,8 +334,10 @@ pub fn parse(bytes: &[u8]) -> Result<PeFile, String> {
                 let thunk_rva = if ilt_rva != 0 { ilt_rva } else { iat_rva };
                 let mut functions = Vec::new();
                 let mut ordinal_count = 0usize;
+                let mut thunks_read = 0usize;
+                let mut thunk_cap_hit = false;
                 if let Some(mut thunk_off) = rva_to_offset(thunk_rva).filter(|o| *o < bytes.len()) {
-                    for _ in 0..10_000 {
+                    loop {
                         let entry = if is_pe32_plus {
                             r.read_u64(thunk_off)
                         } else {
@@ -338,6 +347,12 @@ pub fn parse(bytes: &[u8]) -> Result<PeFile, String> {
                             break; // thunk array truncated: stop here, honestly
                         };
                         if entry == 0 {
+                            break;
+                        }
+                        if thunks_read == MAX_THUNKS_PER_DLL {
+                            // A non-zero thunk exists past the cap: the list
+                            // really was capped, not naturally ended.
+                            thunk_cap_hit = true;
                             break;
                         }
                         const ORDINAL_FLAG: u64 = 0x8000000000000000;
@@ -359,6 +374,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeFile, String> {
                                 ordinal_count += 1; // name unreadable; count honestly
                             }
                         }
+                        thunks_read += 1;
                         thunk_off += if is_pe32_plus { 8 } else { 4 };
                     }
                 }
@@ -367,6 +383,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeFile, String> {
                     dll,
                     functions,
                     ordinal_count,
+                    thunk_cap_hit,
                 });
                 dll_index += 1;
                 at = desc.checked_add(20).filter(|next| *next < bytes.len());
@@ -388,10 +405,14 @@ pub fn parse(bytes: &[u8]) -> Result<PeFile, String> {
                 file.exports_reason = Some("export directory points outside the bytes read".into());
             }
             Some(off) => {
-                let count = r
-                    .read_u32(off + 20)
-                    .unwrap_or(0)
-                    .min(MAX_EXPORT_NAMES as u32);
+                let declared = r.read_u32(off + 20).unwrap_or(0);
+                if declared > MAX_EXPORT_NAMES as u32 {
+                    file.exports_reason = Some(format!(
+                        "export table declares {declared} names; listing capped at \
+                         {MAX_EXPORT_NAMES}"
+                    ));
+                }
+                let count = declared.min(MAX_EXPORT_NAMES as u32);
                 let names_rva = r.read_u32(off + 24).unwrap_or(0);
                 match rva_to_offset(names_rva).filter(|o| *o < bytes.len()) {
                     Some(names_off) => {
@@ -624,5 +645,107 @@ mod tests {
         let file = parse(&full).expect("parses");
         assert!(file.sections.is_empty());
         assert!(file.sections_reason.is_some());
+    }
+
+    /// A synthetic PE32+ exercising both enumeration caps: one DLL whose
+    /// thunk array holds more than [`MAX_THUNKS_PER_DLL`] named entries and
+    /// an export table declaring more than [`MAX_EXPORT_NAMES`] names.
+    /// Built in memory so the caps are tested without a large fixture.
+    fn fat_pe_bytes() -> Vec<u8> {
+        const SECTION_VA: u32 = 0x1000;
+        const RAW_PTR: usize = 0x1B0;
+        const SECTION_SPAN: u32 = 0x30000;
+
+        fn rva_off(rva: u32) -> usize {
+            (rva - SECTION_VA) as usize + RAW_PTR
+        }
+        fn put(bytes: &mut [u8], at: usize, data: &[u8]) {
+            bytes[at..at + data.len()].copy_from_slice(data);
+        }
+        fn put_u16(bytes: &mut [u8], at: usize, v: u16) {
+            put(bytes, at, &v.to_le_bytes());
+        }
+        fn put_u32(bytes: &mut [u8], at: usize, v: u32) {
+            put(bytes, at, &v.to_le_bytes());
+        }
+        fn put_u64(bytes: &mut [u8], at: usize, v: u64) {
+            put(bytes, at, &v.to_le_bytes());
+        }
+
+        let mut bytes = vec![0u8; RAW_PTR + SECTION_SPAN as usize];
+        // DOS header.
+        put(&mut bytes, 0, b"MZ");
+        put_u32(&mut bytes, 0x3C, 0x80);
+        // PE signature + COFF header.
+        put(&mut bytes, 0x80, b"PE\0\0");
+        put_u16(&mut bytes, 0x84, 0x8664); // AMD64
+        put_u16(&mut bytes, 0x86, 1); // one section
+        put_u16(&mut bytes, 0x94, 240); // optional header size
+        put_u16(&mut bytes, 0x96, 0x0022); // executable | large address aware
+                                           // Optional header (PE32+).
+        let opt = 0x98;
+        put_u16(&mut bytes, opt, 0x20B);
+        put_u16(&mut bytes, opt + 68, 3); // console subsystem
+        put_u32(&mut bytes, opt + 108, 16); // NumberOfRvaAndSizes
+        let dirs = opt + 112;
+        put_u32(&mut bytes, dirs, 0x18000); // export directory RVA
+        put_u32(&mut bytes, dirs + 4, 40);
+        put_u32(&mut bytes, dirs + 8, 0x1000); // import directory RVA
+        put_u32(&mut bytes, dirs + 12, 40);
+        // Section table (one section mapping RVA 0x1000..0x31000).
+        let table = 0x188;
+        put(&mut bytes, table, b".fata\0\0\0");
+        put_u32(&mut bytes, table + 8, SECTION_SPAN); // VirtualSize
+        put_u32(&mut bytes, table + 12, SECTION_VA); // VirtualAddress
+        put_u32(&mut bytes, table + 16, SECTION_SPAN); // SizeOfRawData
+        put_u32(&mut bytes, table + 20, RAW_PTR as u32); // PointerToRawData
+        put_u32(&mut bytes, table + 36, 0x6000_0020); // code|read|execute
+                                                      // Import descriptor at RVA 0x1000 (a null terminator follows).
+        let desc = rva_off(0x1000);
+        put_u32(&mut bytes, desc, 0x2000); // OriginalFirstThunk
+        put_u32(&mut bytes, desc + 12, 0x17000); // Name RVA
+                                                 // Thunk array at RVA 0x2000: cap + 5 named entries (the zero
+                                                 // terminator is already in place — the buffer is zeroed).
+        let thunks = rva_off(0x2000);
+        for i in 0..(MAX_THUNKS_PER_DLL + 5) {
+            put_u64(&mut bytes, thunks + i * 8, 0x16000u64);
+        }
+        // Hint/name at RVA 0x16000: u16 hint then "f".
+        let hint_name = rva_off(0x16000);
+        put_u16(&mut bytes, hint_name, 0);
+        put(&mut bytes, hint_name + 2, b"f\0");
+        // DLL name at RVA 0x17000.
+        put(&mut bytes, rva_off(0x17000), b"FAT.dll\0");
+        // Export directory at RVA 0x18000.
+        let exp = rva_off(0x18000);
+        put_u32(&mut bytes, exp + 20, (MAX_EXPORT_NAMES + 100) as u32);
+        put_u32(&mut bytes, exp + 24, 0x19000); // AddressOfNames
+                                                // Names array at RVA 0x19000: every entry points at "e".
+        let names = rva_off(0x19000);
+        for i in 0..(MAX_EXPORT_NAMES + 100) {
+            put_u32(&mut bytes, names + i * 4, 0x24000);
+        }
+        put(&mut bytes, rva_off(0x24000), b"e\0");
+        bytes
+    }
+
+    #[test]
+    fn fat_tables_hit_caps_with_visible_reasons() {
+        let file = parse(&fat_pe_bytes()).expect("parses");
+        assert_eq!(file.imports.len(), 1);
+        assert!(
+            file.imports[0].thunk_cap_hit,
+            "the thunk cap must be visible"
+        );
+        assert_eq!(file.imports[0].functions.len(), MAX_THUNKS_PER_DLL);
+        assert_eq!(file.exports.len(), MAX_EXPORT_NAMES);
+        assert!(
+            file.exports_reason
+                .as_deref()
+                .unwrap()
+                .contains("capped at"),
+            "{:?}",
+            file.exports_reason
+        );
     }
 }

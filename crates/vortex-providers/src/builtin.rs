@@ -732,6 +732,11 @@ fn record_elf(
                     "{location}: ELF section table unavailable: {reason}"
                 ));
             }
+            if let Some(reason) = &file.names_reason {
+                builder.limitation(format!(
+                    "{location}: ELF section names unavailable: {reason}"
+                ));
+            }
             if !file.imports.is_empty() {
                 let truncated = file.imports.len() > limits.max_entries;
                 let imports: Vec<&str> = file
@@ -842,20 +847,30 @@ fn record_pe(
                 ));
             }
             if !file.imports.is_empty() {
-                let truncated = file.imports.len() > limits.max_entries;
+                // Absolute bounds keep one finding's details small however
+                // high the caller set max_entries: DLL rows and names per
+                // row are capped independently, counts stay exact, and every
+                // truncation is flagged (the agent context window is part
+                // of the attack surface — upstream Lesson 2).
+                const MAX_DLL_ROWS: usize = 100;
+                const MAX_NAMES_PER_DLL: usize = 25;
+                let row_cap = limits.max_entries.min(MAX_DLL_ROWS);
+                let name_cap = limits.max_entries.min(MAX_NAMES_PER_DLL);
+                let truncated = file.imports.len() > row_cap;
                 let imports: Vec<_> = file
                     .imports
                     .iter()
-                    .take(limits.max_entries)
+                    .take(row_cap)
                     .map(|dll| {
-                        let functions_truncated = dll.functions.len() > limits.max_entries;
+                        let functions_truncated = dll.functions.len() > name_cap;
                         serde_json::json!({
                             "dll": dll.dll,
-                            "functions": dll.functions.iter().take(limits.max_entries)
+                            "functions": dll.functions.iter().take(name_cap)
                                 .collect::<Vec<_>>(),
                             "function_count": dll.functions.len(),
                             "functions_truncated": functions_truncated,
                             "ordinal_imports": dll.ordinal_count,
+                            "thunk_cap_hit": dll.thunk_cap_hit,
                         })
                     })
                     .collect();
@@ -873,6 +888,13 @@ fn record_pe(
                 );
             } else if let Some(reason) = &file.imports_reason {
                 builder.limitation(format!("{location}: PE imports unavailable: {reason}"));
+            }
+            if file.imports.iter().any(|d| d.thunk_cap_hit) {
+                builder.limitation(format!(
+                    "{location}: a DLL's import list was capped at {} thunks; counts stay \
+                     exact, name enumeration stopped there",
+                    native::pe::MAX_THUNKS_PER_DLL
+                ));
             }
             if !file.exports.is_empty() {
                 let truncated = file.exports.len() > limits.max_entries;
@@ -1138,6 +1160,14 @@ fn record_zip(
                     }),
                 );
             }
+            if listing.safety_dropped > 0 {
+                builder.limitation(format!(
+                    "{location}: {} additional safety observations were suppressed by the \
+                     evidence cap (first {} recorded)",
+                    listing.safety_dropped,
+                    archive::zip_reader::MAX_SAFETY_NOTES
+                ));
+            }
             for error in &listing.errors {
                 builder.warning(format!("{location}: {error}"));
             }
@@ -1392,12 +1422,20 @@ fn inspect_directory(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde_
                     "magic_hex": identification.magic_hex,
                 }),
             );
-            if matches!(
+            if matches!(identification.format.as_str(), "elf" | "pe" | "dex") {
+                builder.limitation(format!(
+                    "{rel_path}: native format '{}' identified by magic bytes only in this \
+                     directory pass; structural parsing is available through single-file \
+                     inspection of this artifact",
+                    identification.format
+                ));
+            } else if matches!(
                 identification.format.as_str(),
-                "elf" | "pe" | "mach-o-32" | "mach-o-64" | "mach-o-fat" | "wasm" | "dex"
+                "mach-o-32" | "mach-o-64" | "mach-o-fat" | "wasm"
             ) {
                 builder.limitation(format!(
-                    "{rel_path}: native/binary format '{}' identified by magic bytes only; deeper analysis needs a native-analysis provider",
+                    "{rel_path}: native format '{}' identified by magic bytes only; \
+                     structural parsing for this format is not supported in this release",
                     identification.format
                 ));
             }

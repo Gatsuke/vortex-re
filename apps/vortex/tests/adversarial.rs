@@ -471,6 +471,318 @@ fn mcp_responses_stay_under_the_size_budget() {
     });
 }
 
+/// Worst-case single-file PE inspection through MCP (audit R2,
+/// docs/AUDIT_2026-10.md): a synthetic PE with 400 imported DLLs x 500
+/// named thunks each makes the `pe_imports` finding quadratic in
+/// `max_entries` (DLL rows x names per row) when uncapped. Record-time
+/// absolute caps plus byte-aware page fitting must keep the response
+/// inside the budget with every truncation flagged - counts stay exact.
+#[test]
+fn fat_pe_inspect_stays_under_the_size_budget() {
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::ServiceExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = service_in(dir.path());
+    let target = dir.path().join("fat.exe");
+    std::fs::write(&target, fat_pe_bytes()).unwrap();
+
+    let service = Arc::new(service);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async move {
+        let server = vortex_app::mcp::VortexServer::new(service.clone());
+        let (client_transport, server_transport) = tokio::io::duplex(8192);
+        let server_handle = tokio::spawn(async move {
+            let running = server.serve(server_transport).await.expect("serve");
+            running.waiting().await.expect("waiting");
+        });
+        let client = DummyClient
+            .serve(client_transport)
+            .await
+            .expect("client serve");
+
+        let inspect = client
+            .call_tool(
+                CallToolRequestParams::new("vortex_inspect_artifact".to_string()).with_arguments(
+                    serde_json::json!({
+                        "path": target,
+                        "max_entries": 500,
+                        "page_size": 100,
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ),
+            )
+            .await
+            .expect("inspect tool");
+        let payload: serde_json::Value =
+            serde_json::from_str(&inspect.content[0].as_text().unwrap().text).unwrap();
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        assert!(
+            bytes.len() < MCP_RESPONSE_BUDGET_BYTES,
+            "fat PE inspect response {} bytes exceeds the {} byte budget",
+            bytes.len(),
+            MCP_RESPONSE_BUDGET_BYTES
+        );
+
+        // The record-time caps are visible in the finding itself: rows and
+        // names bounded, exact counts kept, truncations flagged.
+        let imports_finding = payload["findings"]
+            .as_array()
+            .expect("findings page")
+            .iter()
+            .find(|f| f["kind"] == "pe_imports")
+            .expect("pe_imports finding on page 1");
+        let details = &imports_finding["details"];
+        assert_eq!(details["count"], serde_json::json!(400));
+        assert_eq!(details["truncated"], serde_json::json!(true));
+        let rows = details["imports"].as_array().expect("DLL rows");
+        assert_eq!(rows.len(), 100, "DLL rows are capped at 100");
+        assert_eq!(rows[0]["function_count"], serde_json::json!(500));
+        assert_eq!(rows[0]["functions_truncated"], serde_json::json!(true));
+        assert!(
+            rows[0]["functions"].as_array().unwrap().len() <= 25,
+            "names per DLL are capped at 25"
+        );
+
+        client.cancel().await.expect("client cancel");
+        server_handle.abort();
+    });
+}
+
+/// A synthetic PE32+ with 400 imported DLLs, each importing 500 named
+/// functions (all names shared, to keep the test file small).
+fn fat_pe_bytes() -> Vec<u8> {
+    const SECTION_VA: u32 = 0x1000;
+    const RAW_PTR: usize = 0x1B0;
+    const SECTION_SPAN: u32 = 0x190000;
+    const DLLS: usize = 400;
+    const THUNKS: usize = 500;
+
+    fn rva_off(rva: u32) -> usize {
+        (rva - SECTION_VA) as usize + RAW_PTR
+    }
+    fn put(bytes: &mut [u8], at: usize, data: &[u8]) {
+        bytes[at..at + data.len()].copy_from_slice(data);
+    }
+    fn put_u16(bytes: &mut [u8], at: usize, v: u16) {
+        put(bytes, at, &v.to_le_bytes());
+    }
+    fn put_u32(bytes: &mut [u8], at: usize, v: u32) {
+        put(bytes, at, &v.to_le_bytes());
+    }
+    fn put_u64(bytes: &mut [u8], at: usize, v: u64) {
+        put(bytes, at, &v.to_le_bytes());
+    }
+
+    let mut bytes = vec![0u8; RAW_PTR + SECTION_SPAN as usize];
+    put(&mut bytes, 0, b"MZ");
+    put_u32(&mut bytes, 0x3C, 0x80);
+    put(&mut bytes, 0x80, b"PE\0\0");
+    put_u16(&mut bytes, 0x84, 0x8664); // AMD64
+    put_u16(&mut bytes, 0x86, 1); // one section
+    put_u16(&mut bytes, 0x94, 240); // optional header size
+    put_u16(&mut bytes, 0x96, 0x0022);
+    let opt = 0x98;
+    put_u16(&mut bytes, opt, 0x20B); // PE32+
+    put_u16(&mut bytes, opt + 68, 3); // console
+    put_u32(&mut bytes, opt + 108, 16);
+    let dirs = opt + 112;
+    put_u32(&mut bytes, dirs + 8, SECTION_VA); // import directory RVA
+    put_u32(&mut bytes, dirs + 12, (DLLS as u32 + 1) * 20);
+    let table = 0x188;
+    put(&mut bytes, table, b".fat\0\0\0\0");
+    put_u32(&mut bytes, table + 8, SECTION_SPAN);
+    put_u32(&mut bytes, table + 12, SECTION_VA);
+    put_u32(&mut bytes, table + 16, SECTION_SPAN);
+    put_u32(&mut bytes, table + 20, RAW_PTR as u32);
+    put_u32(&mut bytes, table + 36, 0x6000_0020);
+
+    const DESCRIPTORS: u32 = 0x1000; // 400 descriptors + null terminator
+    const THUNK_ARRAYS: u32 = 0x4000; // (THUNKS + 1) entries * 8 bytes per DLL
+    const DLL_NAMES: u32 = 0x18E000; // 16 bytes per name
+    const HINT_NAME: u32 = 0x18F000; // shared "f"
+    for i in 0..DLLS {
+        let desc = rva_off(DESCRIPTORS + (i as u32) * 20);
+        put_u32(
+            &mut bytes,
+            desc,
+            THUNK_ARRAYS + (i as u32) * (THUNKS as u32 + 1) * 8,
+        );
+        put_u32(&mut bytes, desc + 12, DLL_NAMES + (i as u32) * 16);
+        let name = rva_off(DLL_NAMES + (i as u32) * 16);
+        let dll = format!("DLL{i:03}.dll\0");
+        put(&mut bytes, name, dll.as_bytes());
+        let array = rva_off(THUNK_ARRAYS + (i as u32) * (THUNKS as u32 + 1) * 8);
+        for t in 0..THUNKS {
+            put_u64(&mut bytes, array + t * 8, HINT_NAME as u64);
+        }
+        // The zero terminator is already in place (zeroed buffer).
+    }
+    let hint = rva_off(HINT_NAME);
+    put_u16(&mut bytes, hint, 0);
+    put(&mut bytes, hint + 2, b"f\0");
+    bytes
+}
+
+/// Native and archive adversarial shapes through both inspection paths
+/// (audit R7): the directory pass identifies by magic only and says what
+/// deeper analysis exists; the single-file pass structurally parses, and
+/// garbage must degrade to honest warnings/limitations - never a crash.
+#[test]
+fn native_and_archive_adversarial_inputs_degrade() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = service_in(dir.path());
+    let base = dir.path().join("hostile");
+    std::fs::create_dir_all(&base).unwrap();
+
+    // ELF magic with a zeroed header (e_shentsize patched to the expected
+    // 64 so the header itself parses): no section table, all reasons.
+    let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+    elf.resize(256, 0);
+    elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+    std::fs::write(base.join("elf-garbage"), &elf).unwrap();
+
+    // MZ with a zeroed DOS header: e_lfanew cannot resolve.
+    let mut pe = b"MZ".to_vec();
+    pe.resize(256, 0);
+    std::fs::write(base.join("pe-garbage.exe"), &pe).unwrap();
+
+    // DEX magic with an all-zero tail: header parses, nothing follows.
+    let mut dex = b"dex\n035\x00".to_vec();
+    dex.resize(256, 0);
+    std::fs::write(base.join("dex-garbage.dex"), &dex).unwrap();
+
+    // A zip full of traversal names (the safety-note cap is exercised end
+    // to end through the single-file path).
+    {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+        let mut writer = ZipWriter::new(std::fs::File::create(base.join("traversal.zip")).unwrap());
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for i in 0..60 {
+            writer
+                .start_file(format!("../evil{i}.txt"), options)
+                .unwrap();
+            writer.write_all(b"x").unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    // Directory pass: magic-only identification, honest pointers.
+    let dir_result = service
+        .inspect(&base, &OperationOptions::default(), &CancelToken::new())
+        .expect("directory inspect must not panic");
+    assert_honest_terminal_state(&dir_result);
+    assert!(
+        dir_result
+            .report
+            .findings
+            .iter()
+            .filter(|f| f.kind == "binary_artifact")
+            .count()
+            >= 3,
+        "native and archive files are listed as binary artifacts: {:?}",
+        dir_result.report.findings
+    );
+    assert!(
+        dir_result
+            .report
+            .limitations
+            .iter()
+            .any(|l| l.contains("magic bytes only in this directory pass")),
+        "the directory pass says what it did NOT do: {:?}",
+        dir_result.report.limitations
+    );
+
+    // Single-file passes: structural parsing runs and garbage degrades.
+    let pe_result = service
+        .inspect(
+            &base.join("pe-garbage.exe"),
+            &OperationOptions::default(),
+            &CancelToken::new(),
+        )
+        .expect("single-file PE inspect must not panic");
+    assert_honest_terminal_state(&pe_result);
+    assert!(
+        pe_result
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.contains("identified as PE")),
+        "garbage PE is called out: {:?}",
+        pe_result.report.warnings
+    );
+
+    let elf_result = service
+        .inspect(
+            &base.join("elf-garbage"),
+            &OperationOptions::default(),
+            &CancelToken::new(),
+        )
+        .expect("single-file ELF inspect must not panic");
+    assert_honest_terminal_state(&elf_result);
+    assert!(
+        elf_result
+            .report
+            .limitations
+            .iter()
+            .any(|l| l.contains("ELF analysis is structural only")),
+        "garbage ELF still states its scope: {:?}",
+        elf_result.report.limitations
+    );
+
+    let dex_result = service
+        .inspect(
+            &base.join("dex-garbage.dex"),
+            &OperationOptions::default(),
+            &CancelToken::new(),
+        )
+        .expect("single-file DEX inspect must not panic");
+    assert_honest_terminal_state(&dex_result);
+    assert!(
+        dex_result
+            .report
+            .findings
+            .iter()
+            .any(|f| f.kind == "dex_header"),
+        "the DEX header itself still parses: {:?}",
+        dex_result.report.findings
+    );
+
+    let zip_result = service
+        .inspect(
+            &base.join("traversal.zip"),
+            &OperationOptions::default(),
+            &CancelToken::new(),
+        )
+        .expect("single-file zip inspect must not panic");
+    assert_honest_terminal_state(&zip_result);
+    assert!(
+        zip_result
+            .report
+            .findings
+            .iter()
+            .any(|f| f.kind == "archive_safety"),
+        "traversal names were flagged as safety findings"
+    );
+    assert!(
+        zip_result
+            .report
+            .limitations
+            .iter()
+            .any(|l| l.contains("suppressed by the evidence cap")),
+        "the safety-note cap is disclosed: {:?}",
+        zip_result.report.limitations
+    );
+}
+
 #[derive(Debug, Clone, Default)]
 struct DummyClient;
 

@@ -56,6 +56,10 @@ pub struct ElfFile {
     pub sections: Vec<ElfSection>,
     /// Why the section table (or part of it) is missing, when it is.
     pub sections_reason: Option<String>,
+    /// Why section names could not be resolved when the table itself was
+    /// listed (unresolvable `e_shstrndx` or a string table beyond the bytes
+    /// read). Sections are still listed, with empty names.
+    pub names_reason: Option<String>,
     /// Total section count from the header (may exceed `sections.len()`).
     pub section_total: usize,
     /// Undefined dynamic symbols with names (bounded by [`MAX_SYMBOLS`]).
@@ -199,6 +203,7 @@ pub fn parse(bytes: &[u8]) -> Result<ElfFile, String> {
         phnum,
         sections: Vec::new(),
         sections_reason: None,
+        names_reason: None,
         section_total: shnum as usize,
         imports: Vec::new(),
         imports_reason: None,
@@ -283,22 +288,42 @@ pub fn parse(bytes: &[u8]) -> Result<ElfFile, String> {
     } else {
         Some(shstrndx as usize)
     };
-    let name_reader = shstrndx_resolved
-        .and_then(|idx| raw_sections.get(idx))
-        .map(|sh| {
-            (
-                Reader::with_endian(
-                    reader
-                        .slice(
-                            sh.offset as usize,
-                            sh.size.min(MAX_NAME_BYTES as u64 * 64) as usize,
-                        )
-                        .unwrap_or(&[]),
-                    data == ELFDATA2MSB,
-                ),
-                sh.size,
-            )
-        });
+    // The name table can fail three ways; each leaves the sections listed
+    // (with empty names) plus an explicit reason instead of a silent gap.
+    let mut names_reason: Option<String> = None;
+    let name_reader = match shstrndx_resolved {
+        None => {
+            names_reason = Some(
+                "e_shstrndx does not resolve to a section; section names unavailable".to_string(),
+            );
+            None
+        }
+        Some(idx) => match raw_sections.get(idx) {
+            None => {
+                names_reason = Some(format!(
+                    "e_shstrndx {idx} is out of range; section names unavailable"
+                ));
+                None
+            }
+            Some(sh) => {
+                match reader.slice(
+                    sh.offset as usize,
+                    sh.size.min(MAX_NAME_BYTES as u64 * 64) as usize,
+                ) {
+                    Some(bytes) => Some((Reader::with_endian(bytes, data == ELFDATA2MSB), sh.size)),
+                    None => {
+                        names_reason = Some(
+                            "section-header string table lies beyond the bytes read; section \
+                             names unavailable"
+                                .to_string(),
+                        );
+                        None
+                    }
+                }
+            }
+        },
+    };
+    file.names_reason = names_reason;
 
     for raw in &raw_sections {
         let name = name_reader
@@ -325,16 +350,25 @@ pub fn parse(bytes: &[u8]) -> Result<ElfFile, String> {
             Some("no .dynsym section (statically linked or stripped)".to_string());
         return Ok(file);
     }
+    // Per-dynsym problems are collected, not last-write-wins: one bad
+    // section never erases another's reason, and a lying sh_link degrades
+    // that section's imports to a note instead of discarding the whole
+    // parse (the upstream #1911 lesson: keep completed work).
+    let mut import_notes: Vec<String> = Vec::new();
     for dynsym_idx in dynsym_indexes {
         let sym = &raw_sections[dynsym_idx];
-        let strtab = raw_sections
-            .get(sym.link as usize)
-            .ok_or("bad .dynsym sh_link (strtab index out of range)")?;
+        let Some(strtab) = raw_sections.get(sym.link as usize) else {
+            import_notes.push(format!(
+                ".dynsym section {dynsym_idx} has sh_link {} (strtab index out of range); \
+                 its imports are unavailable",
+                sym.link
+            ));
+            continue;
+        };
         let Some(str_bytes) =
             reader.slice(strtab.offset as usize, strtab.size.min(1 << 20) as usize)
         else {
-            file.imports_reason =
-                Some(".dynstr lies beyond the bytes read; imports unavailable".into());
+            import_notes.push(".dynstr lies beyond the bytes read; imports unavailable".into());
             continue;
         };
         let str_reader = Reader::with_endian(str_bytes, data == ELFDATA2MSB);
@@ -375,13 +409,16 @@ pub fn parse(bytes: &[u8]) -> Result<ElfFile, String> {
             }
         }
         if truncated_by_cap {
-            file.imports_reason = Some(format!(
+            import_notes.push(format!(
                 ".dynsym has more than {MAX_SYMBOLS} entries; enumeration stopped there"
             ));
         }
     }
-    if file.imports.is_empty() && file.imports_reason.is_none() {
-        file.imports_reason = Some("no undefined dynamic symbols with names found".to_string());
+    if file.imports.is_empty() && import_notes.is_empty() {
+        import_notes.push("no undefined dynamic symbols with names found".to_string());
+    }
+    if !import_notes.is_empty() {
+        file.imports_reason = Some(import_notes.join("; "));
     }
     Ok(file)
 }
@@ -485,5 +522,38 @@ mod tests {
         let file = parse(&full).expect("header parses");
         assert!(file.sections.is_empty());
         assert!(file.sections_reason.is_some());
+    }
+
+    #[test]
+    fn bad_dynsym_sh_link_degrades_instead_of_discarding_work() {
+        let mut full = fixture("elf64-demo");
+        // .dynsym is section 2; its sh_link (to .dynstr) lives at
+        // shoff + 2*64 + 40. Point it out of range: the header and the
+        // five sections must survive with an honest imports reason.
+        let shoff = u64::from_le_bytes(full[40..48].try_into().unwrap()) as usize;
+        let at = shoff + 2 * 64 + 40;
+        full[at..at + 4].copy_from_slice(&99u32.to_le_bytes());
+        let file = parse(&full).expect("completed work survives a lying sh_link");
+        assert_eq!(file.section_total, 5);
+        assert_eq!(file.sections.len(), 5);
+        assert!(file.imports.is_empty());
+        assert!(file.imports_reason.as_deref().unwrap().contains("sh_link"));
+    }
+
+    #[test]
+    fn unresolvable_shstrndx_leaves_nameless_sections_with_a_reason() {
+        let mut full = fixture("elf64-demo");
+        // e_shstrndx at 62; point it out of range.
+        full[62..64].copy_from_slice(&99u16.to_le_bytes());
+        let file = parse(&full).expect("parses");
+        assert!(!file.sections.is_empty());
+        assert!(file.sections.iter().all(|s| s.name.is_empty()));
+        assert!(file
+            .names_reason
+            .as_deref()
+            .unwrap()
+            .contains("out of range"));
+        // The section table itself is still healthy.
+        assert!(file.sections_reason.is_none());
     }
 }

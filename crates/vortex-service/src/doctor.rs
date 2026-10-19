@@ -488,25 +488,35 @@ pub fn run_doctor(service: &VortexService) -> DoctorReport {
         not_supported: vec![
             NotSupported {
                 operation: "decompile / disassemble native executables".to_string(),
-                reason: "no native-analysis provider is integrated".to_string(),
+                reason: "structural parsing of ELF and PE/COFF is built in \
+                         (headers, sections, imports/exports); disassembly and \
+                         decompilation need a code-analysis backend"
+                    .to_string(),
                 prerequisite: Some(
                     "a future Rizin-based provider (planned, not available)".to_string(),
                 ),
             },
             NotSupported {
-                operation: "analyze .NET assemblies".to_string(),
-                reason: "no managed-code provider is integrated".to_string(),
+                operation: "deep .NET analysis (type system, CIL, member listing)".to_string(),
+                reason: "built-in support is a metadata inventory (runtime version, \
+                         entry-point token, metadata stream names/sizes); no managed-code \
+                         type analysis is integrated"
+                    .to_string(),
                 prerequisite: Some("planned provider (see docs/ROADMAP.md)".to_string()),
             },
             NotSupported {
-                operation: "analyze Android DEX/APK".to_string(),
-                reason: "no Android provider is integrated; DEX files are identified by magic only"
+                operation: "deep DEX analysis (bytecode, protos, fields, methods)".to_string(),
+                reason: "built-in support reads DEX headers, table counts, verified \
+                         checksums, and defined-class lists — including classes*.dex \
+                         members inside APKs; bytecode-level analysis is not integrated"
                     .to_string(),
                 prerequisite: Some("planned provider (see docs/ROADMAP.md)".to_string()),
             },
             NotSupported {
                 operation: "extract archives (zip/asar)".to_string(),
-                reason: "archive extraction is not implemented in this release".to_string(),
+                reason: "archive extraction is not implemented in this release; members \
+                         are listed and read in memory under bounded budgets instead"
+                    .to_string(),
                 prerequisite: Some(
                     "planned capability with explicit safety review (see docs/THREAT_MODEL.md)"
                         .to_string(),
@@ -599,5 +609,75 @@ mod tests {
         assert_eq!(store_check.status, CheckStatus::Warn);
         assert!(store_check.detail.contains("1 unreadable"));
         assert_eq!(report.overall(), CheckStatus::Warn);
+    }
+
+    #[test]
+    fn capabilities_do_not_contradict_themselves() {
+        // Regression guard for the Phase-Three audit finding (R1 in
+        // docs/AUDIT_2026-10.md): `supported_now` advertised DEX and .NET
+        // reading while `not_supported` still claimed those areas were
+        // untouched — direct contradictions shipped to MCP clients through
+        // vortex_capabilities.
+        let dir = tempfile::tempdir().unwrap();
+        let config = VortexConfig {
+            data_dir: dir.path().join("data"),
+            limits: ResourceLimits::default(),
+            allowed_roots: None,
+            notes: Vec::new(),
+            provider_overrides: Default::default(),
+            stale_run_grace_secs: 3600,
+            config_file: None,
+        };
+        let service = VortexService::new(config).unwrap();
+        let report = service.doctor();
+
+        // The built-in structural support is advertised as available.
+        assert!(report
+            .supported_now
+            .iter()
+            .any(|s| s.contains("Android DEX")));
+        assert!(report.supported_now.iter().any(|s| s.contains(".NET")));
+        assert!(report
+            .supported_now
+            .iter()
+            .any(|s| s.contains("ELF and PE/COFF")));
+
+        // The stale, contradicting entries are gone in their old wording.
+        let operations: Vec<&str> = report
+            .not_supported
+            .iter()
+            .map(|n| n.operation.as_str())
+            .collect();
+        assert!(!operations
+            .iter()
+            .any(|o| o.contains("analyze .NET assemblies")));
+        assert!(!operations
+            .iter()
+            .any(|o| o.contains("analyze Android DEX/APK")));
+
+        // No reason claims DEX files are only identified by magic — they
+        // are structurally read, checksums verified, classes listed.
+        assert!(!report
+            .not_supported
+            .iter()
+            .any(|n| n.reason.contains("magic only")));
+
+        // The disassembly entry acknowledges the built-in structural level
+        // instead of denying any native analysis exists.
+        let disasm = report
+            .not_supported
+            .iter()
+            .find(|n| n.operation.contains("decompile"))
+            .expect("disassembly stays honestly unsupported");
+        assert!(disasm.reason.contains("built in"));
+
+        // Deep-analysis entries name what IS built in, so an agent can
+        // route to the right operation instead of giving up.
+        let dex = report
+            .not_supported
+            .iter()
+            .find(|n| n.operation.contains("deep DEX"))
+            .expect("deep DEX boundary stays stated");
+        assert!(dex.reason.contains("built-in support"));
     }
 }

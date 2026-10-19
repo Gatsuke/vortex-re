@@ -42,6 +42,10 @@ pub struct AsarMember {
     pub offset: u64,
     /// True when the file lives in the `.unpacked` sibling directory.
     pub unpacked: bool,
+    /// True when the header carried a usable `size`/`offset` (or the
+    /// member is unpacked). Packed members without both are listed but
+    /// refused for content reads — their bytes cannot be located.
+    pub locatable: bool,
     /// True when the header marks the file executable.
     pub executable: bool,
     /// True when the header carries an integrity block.
@@ -59,6 +63,8 @@ pub struct AsarListing {
     pub truncated: bool,
     /// Non-fatal problems observed while walking the tree.
     pub errors: Vec<String>,
+    /// Errors beyond [`MAX_HEADER_ERRORS`] that were not recorded.
+    pub errors_dropped: usize,
     /// JSON header size in bytes (metadata, reported for evidence).
     pub header_size: u64,
     /// Where the data region starts in the file.
@@ -67,6 +73,13 @@ pub struct AsarListing {
 
 /// Maximum directory-nesting depth accepted in the header tree.
 const MAX_DEPTH: usize = 64;
+/// Hard cap on header nodes visited, however large the JSON header is:
+/// the walk must stay bounded even when the header lies about the tree
+/// it describes.
+const MAX_HEADER_NODES: usize = 10_000;
+/// Cap on per-member errors recorded from the walk (a summary line covers
+/// the rest).
+const MAX_HEADER_ERRORS: usize = 100;
 
 /// List members of an asar archive. `Err` means "not an asar we can read".
 pub fn list(path: &Path, limits: &ResourceLimits) -> Result<AsarListing, String> {
@@ -126,62 +139,109 @@ pub fn list(path: &Path, limits: &ResourceLimits) -> Result<AsarListing, String>
         data_base: 8 + header_pickle_len,
         ..AsarListing::default()
     };
-    walk_files(&header, "", 0, limits, &mut listing);
-    if listing.members.len() > limits.max_archive_members {
-        // walk_files caps pushes; note the exact total separately below.
+    let mut stopped = false;
+    walk_files(&header, "", 0, limits, &mut listing, &mut stopped);
+    if listing.errors_dropped > 0 {
+        listing.errors.push(format!(
+            "{} additional header problems were suppressed (cap {MAX_HEADER_ERRORS})",
+            listing.errors_dropped
+        ));
     }
     Ok(listing)
 }
 
+/// Record a walk error, bounded by [`MAX_HEADER_ERRORS`].
+fn note_error(listing: &mut AsarListing, text: String) {
+    if listing.errors.len() < MAX_HEADER_ERRORS {
+        listing.errors.push(text);
+    } else {
+        listing.errors_dropped += 1;
+    }
+}
+
 /// Recursively walk the `{"files": {...}}` tree, collecting file nodes.
+/// The walk is bounded in three dimensions: depth ([`MAX_DEPTH`]), total
+/// nodes ([`MAX_HEADER_NODES`]), and recorded errors
+/// ([`MAX_HEADER_ERRORS`]).
 fn walk_files(
     node: &Value,
     prefix: &str,
     depth: usize,
     limits: &ResourceLimits,
     listing: &mut AsarListing,
+    stopped: &mut bool,
 ) {
+    if *stopped {
+        return;
+    }
     if depth > MAX_DEPTH {
-        listing.errors.push(format!(
-            "header tree deeper than {MAX_DEPTH} levels; stopped at {prefix:?}"
-        ));
+        note_error(
+            listing,
+            format!("header tree deeper than {MAX_DEPTH} levels; stopped at {prefix:?}"),
+        );
         return;
     }
     let Some(files) = node.get("files").and_then(Value::as_object) else {
-        listing
-            .errors
-            .push(format!("{prefix:?}: node has no files map"));
+        note_error(listing, format!("{prefix:?}: node has no files map"));
         return;
     };
     for (name, child) in files {
+        if *stopped {
+            break;
+        }
         let path = if prefix.is_empty() {
             name.clone()
         } else {
             format!("{prefix}/{name}")
         };
         if child.get("files").is_some() {
-            walk_files(child, &path, depth + 1, limits, listing);
+            walk_files(child, &path, depth + 1, limits, listing, stopped);
             continue;
         }
         listing.total_members += 1;
+        if listing.total_members >= MAX_HEADER_NODES {
+            if !*stopped {
+                note_error(
+                    listing,
+                    format!(
+                        "header tree reached the {MAX_HEADER_NODES}-node safety cap; any \
+                         further entries are uncounted"
+                    ),
+                );
+                listing.truncated = true;
+                *stopped = true;
+            }
+            break;
+        }
         if listing.members.len() >= limits.max_archive_members {
             listing.truncated = true;
             continue;
         }
-        let size = child.get("size").and_then(Value::as_u64).unwrap_or(0);
+        let size = child.get("size").and_then(Value::as_u64);
         let offset = child
             .get("offset")
             .and_then(Value::as_str)
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+            .and_then(|s| s.parse::<u64>().ok());
+        let unpacked = child
+            .get("unpacked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let locatable = unpacked || (size.is_some() && offset.is_some());
+        if !locatable {
+            note_error(
+                listing,
+                format!(
+                    "{path}: header size/offset is missing or not a number; content \
+                     cannot be located"
+                ),
+            );
+        }
         listing.members.push(AsarMember {
             path,
-            size,
-            offset,
-            unpacked: child
-                .get("unpacked")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            size: size.unwrap_or(0),
+            offset: offset.unwrap_or(0),
+            unpacked,
+            locatable,
             executable: child
                 .get("executable")
                 .and_then(Value::as_bool)
@@ -210,6 +270,12 @@ pub fn read_member(
     if entry.unpacked {
         return MemberRead::Failed(format!(
             "member {member:?} is stored unpacked beside the archive, not inside it"
+        ));
+    }
+    if !entry.locatable {
+        return MemberRead::Failed(format!(
+            "member {member:?} has no usable size/offset in the header; its content \
+             cannot be located"
         ));
     }
     let allow = limits.max_archive_member_bytes.min(*budget);
@@ -396,5 +462,75 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let err = list(&path, &ResourceLimits::default()).unwrap_err();
         assert!(err.contains("claims") || err.contains("header"), "{err}");
+    }
+
+    /// Build an in-memory asar whose header is exactly `header_json`
+    /// (pickles laid out the way the official tool writes them).
+    fn synth_asar(header_json: &str) -> Vec<u8> {
+        let json = header_json.as_bytes();
+        let json_len = json.len() + 1; // the format counts the NUL
+        let padded = json_len.div_ceil(4) * 4;
+        let header_pickle_len = 8 + padded;
+        let mut bytes = Vec::with_capacity(8 + header_pickle_len);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&(header_pickle_len as u32).to_le_bytes());
+        bytes.extend_from_slice(&((header_pickle_len - 4) as u32).to_le_bytes());
+        bytes.extend_from_slice(&(json_len as u32).to_le_bytes());
+        bytes.extend_from_slice(json);
+        bytes.push(0);
+        bytes.resize(8 + header_pickle_len, 0);
+        bytes
+    }
+
+    #[test]
+    fn corrupt_size_and_offset_are_refused_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.asar");
+        // `size` is not a number on a.txt; `offset` is not a decimal string
+        // on b.txt. Both must be listed with errors and refused for reads —
+        // never silently read from offset 0.
+        let header = r#"{"files":{
+            "a.txt": {"size": "big", "offset": "0"},
+            "b.txt": {"size": 3, "offset": "x"}}}"#;
+        std::fs::write(&path, synth_asar(header)).unwrap();
+        let listing = list(&path, &limits_with(500)).expect("header parses");
+        assert_eq!(listing.total_members, 2);
+        assert!(listing
+            .errors
+            .iter()
+            .any(|e| e.contains("a.txt") && e.contains("cannot be located")));
+        assert!(listing
+            .errors
+            .iter()
+            .any(|e| e.contains("b.txt") && e.contains("cannot be located")));
+        let mut budget = u64::MAX;
+        for member in ["a.txt", "b.txt"] {
+            match read_member(&path, member, &limits_with(500), &mut budget) {
+                MemberRead::Failed(reason) => {
+                    assert!(reason.contains("size/offset"), "{reason}")
+                }
+                other => panic!("expected refusal for {member}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn huge_header_tree_stops_at_a_node_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.asar");
+        // 12,000 file nodes in one directory: past the 10,000-node cap.
+        let mut header = String::from("{\"files\":{");
+        for i in 0..12_000 {
+            if i > 0 {
+                header.push(',');
+            }
+            header.push_str(&format!("\"f{i}\":{{\"size\":1,\"offset\":\"0\"}}"));
+        }
+        header.push_str("}}");
+        std::fs::write(&path, synth_asar(&header)).unwrap();
+        let listing = list(&path, &limits_with(500)).expect("parses");
+        assert_eq!(listing.total_members, 10_000);
+        assert!(listing.truncated);
+        assert!(listing.errors.iter().any(|e| e.contains("safety cap")));
     }
 }

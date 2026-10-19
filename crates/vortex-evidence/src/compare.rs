@@ -5,7 +5,7 @@
 //! a difference is a *behavioral* difference, and every comparison result
 //! carries a note saying so.
 
-use crate::model::{EvidenceRun, Finding, Relationship, RunSummary};
+use crate::model::{EvidenceRun, Finding, Relationship, RunStatus, RunSummary};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -232,6 +232,34 @@ pub fn compare_runs(a: &EvidenceRun, b: &EvidenceRun) -> RunComparison {
             a.provider.id, a.provider.version, b.provider.id, b.provider.version
         ));
     }
+    // Incompleteness disclosure (upstream Lesson 2): a run that did not
+    // end `succeeded` may be missing findings for reasons unrelated to the
+    // artifact — truncation, cancellation, or failure. Its side of the diff
+    // must never read as proof that something was removed.
+    for (label, run) in [("A", a), ("B", b)] {
+        if run.status != RunStatus::Succeeded {
+            notes.push(format!(
+                "run {label} ended '{}'; its recorded evidence may be incomplete — \
+                 findings absent from run {label} are not established as absent from \
+                 the artifact",
+                run.status.as_str()
+            ));
+        }
+    }
+    if a.status != RunStatus::Succeeded && b.status != RunStatus::Succeeded {
+        notes.push(
+            "neither run is a complete record; an empty diff is not evidence of \
+             equivalence"
+                .to_string(),
+        );
+    }
+    if a.target.sha256 != b.target.sha256 {
+        notes.push(
+            "the runs examined different artifacts (SHA-256 digests differ); the \
+             differences below include the artifact change itself"
+                .to_string(),
+        );
+    }
     if truncated {
         notes.push(format!(
             "diff lists were truncated to {MAX_DIFF_ENTRIES} entries per bucket; see totals for full counts"
@@ -371,5 +399,68 @@ mod tests {
         assert_eq!(comparison.findings_only_in_a.len(), MAX_DIFF_ENTRIES);
         assert_eq!(comparison.totals.findings_only_in_a, 500);
         assert!(comparison.truncated);
+    }
+
+    #[test]
+    fn non_succeeded_runs_are_disclosed_as_incomplete_evidence() {
+        let a = run_with_findings("a", &["one", "two"]);
+        let mut b = run_with_findings("a", &["one"]);
+        b.status = RunStatus::Partial;
+        let comparison = compare_runs(&a, &b);
+        assert!(comparison
+            .notes
+            .iter()
+            .any(|n| n.contains("run B ended 'partial'")));
+        assert!(comparison
+            .notes
+            .iter()
+            .any(|n| n.contains("not established as absent from the artifact")));
+        // The structural diff itself is still reported — with the caveat.
+        assert_eq!(comparison.findings_only_in_a.len(), 1);
+    }
+
+    #[test]
+    fn two_incomplete_runs_never_imply_equivalence() {
+        let mut a = run_with_findings("a", &[]);
+        let mut b = run_with_findings("a", &[]);
+        a.status = RunStatus::Partial;
+        b.status = RunStatus::Cancelled;
+        let comparison = compare_runs(&a, &b);
+        assert!(comparison
+            .notes
+            .iter()
+            .any(|n| n.contains("not evidence of equivalence")));
+        assert!(comparison
+            .notes
+            .iter()
+            .any(|n| n.contains("run A ended 'partial'")));
+        assert!(comparison
+            .notes
+            .iter()
+            .any(|n| n.contains("run B ended 'cancelled'")));
+    }
+
+    #[test]
+    fn different_artifacts_are_called_out_plainly() {
+        let a = run_with_findings("a", &["x"]);
+        let mut b = run_with_findings("b", &["x"]);
+        b.target.sha256 = "d".repeat(64);
+        let comparison = compare_runs(&a, &b);
+        assert!(comparison
+            .notes
+            .iter()
+            .any(|n| n.contains("different artifacts")));
+    }
+
+    #[test]
+    fn succeeded_pair_adds_no_incompleteness_noise() {
+        let a = run_with_findings("a", &["one"]);
+        let b = run_with_findings("a", &["one"]);
+        let comparison = compare_runs(&a, &b);
+        assert!(!comparison
+            .notes
+            .iter()
+            .any(|n| n.contains("may be incomplete")));
+        assert!(!comparison.notes.iter().any(|n| n.contains("equivalence")));
     }
 }

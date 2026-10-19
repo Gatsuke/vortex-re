@@ -44,6 +44,126 @@ fn bridge_cancellation(ct: &CancellationToken) -> (CancelToken, tokio::task::Joi
     (vortex_cancel, watcher)
 }
 
+/// Response bounding for agent context windows (audit R2,
+/// docs/AUDIT_2026-10.md; upstream Lesson 2).
+///
+/// Item-count pagination alone cannot bound a response when a single item
+/// can grow: a `pe_imports` finding carries DLL rows × function names, an
+/// `archive_members` finding carries one row per member. These helpers
+/// keep whole items until a byte budget is hit, then trim the page and say
+/// so — `byte_capped` is never silent, and counts always tell the truth.
+mod bounding {
+    /// Byte budget for one tool response's item list. The budget test's
+    /// 256 KiB ceiling leaves room for headers, pagination metadata, and
+    /// the echoed limitation/unknown text lists.
+    pub const ITEM_BUDGET_BYTES: usize = 128 * 1024;
+    /// Byte budget for echoed limitation/unknown text lists. Full lists
+    /// stay available through `vortex_read_evidence`, which paginates them.
+    pub const TEXT_BUDGET_BYTES: usize = 16 * 1024;
+
+    /// Keep whole serialized items until `budget` is exhausted. The first
+    /// item is always kept (a non-empty page is never emptied by the
+    /// budget; record-time caps keep single items far below the ceiling).
+    /// Returns the kept items and whether any were dropped.
+    pub fn fit_items(
+        items: Vec<serde_json::Value>,
+        budget: usize,
+    ) -> (Vec<serde_json::Value>, bool) {
+        let mut kept: Vec<serde_json::Value> = Vec::with_capacity(items.len());
+        let mut used = 0usize;
+        let mut capped = false;
+        for (index, item) in items.into_iter().enumerate() {
+            let size = serde_json::to_vec(&item).map_or(0, |v| v.len());
+            if index == 0 || used + size <= budget {
+                used += size;
+                kept.push(item);
+            } else {
+                capped = true;
+                break;
+            }
+        }
+        (kept, capped)
+    }
+
+    /// The same fitting for text lists (limitations, unknowns).
+    pub fn fit_texts(texts: &[String], budget: usize) -> (Vec<String>, bool) {
+        let mut kept: Vec<String> = Vec::with_capacity(texts.len());
+        let mut used = 0usize;
+        let mut capped = false;
+        for (index, text) in texts.iter().enumerate() {
+            // The +2 covers the JSON quotes around the string.
+            let size = text.len() + 2;
+            if index == 0 || used + size <= budget {
+                used += size;
+                kept.push(text.clone());
+            } else {
+                capped = true;
+                break;
+            }
+        }
+        (kept, capped)
+    }
+}
+
+#[cfg(test)]
+mod bounding_tests {
+    use super::bounding::*;
+
+    /// A JSON object whose serialized size is a bit over `size_hint` bytes.
+    fn item(size_hint: usize) -> serde_json::Value {
+        serde_json::json!({ "pad": "x".repeat(size_hint) })
+    }
+
+    #[test]
+    fn small_items_all_fit() {
+        let items: Vec<_> = (0..10).map(|_| item(100)).collect();
+        let (kept, capped) = fit_items(items, 8 * 1024);
+        assert_eq!(kept.len(), 10);
+        assert!(!capped);
+    }
+
+    #[test]
+    fn oversized_pages_trim_whole_items_with_a_flag() {
+        let items: Vec<_> = (0..50).map(|_| item(10_000)).collect();
+        let (kept, capped) = fit_items(items, 32 * 1024);
+        assert!(capped);
+        assert!(!kept.is_empty() && kept.len() < 50);
+        let used: usize = kept
+            .iter()
+            .map(|i| serde_json::to_vec(i).unwrap().len())
+            .sum();
+        assert!(used < 32 * 1024 + 10_200, "{used}");
+    }
+
+    #[test]
+    fn the_first_item_is_never_dropped_by_the_budget() {
+        let items = vec![item(64 * 1024), item(100)];
+        let (kept, capped) = fit_items(items, 1024);
+        assert_eq!(kept.len(), 1);
+        assert!(capped);
+    }
+
+    #[test]
+    fn empty_lists_stay_empty_and_uncapped() {
+        let (kept, capped) = fit_items(Vec::new(), 1024);
+        assert!(kept.is_empty());
+        assert!(!capped);
+        let (kept, capped) = fit_texts(&[], 1024);
+        assert!(kept.is_empty());
+        assert!(!capped);
+    }
+
+    #[test]
+    fn text_lists_fit_by_bytes_with_a_flag() {
+        let texts: Vec<String> = (0..100)
+            .map(|i| format!("limitation {i}: {}", "y".repeat(200)))
+            .collect();
+        let (kept, capped) = fit_texts(&texts, 4 * 1024);
+        assert!(capped);
+        assert!(!kept.is_empty() && kept.len() < 100);
+    }
+}
+
 /// The MCP server state.
 #[derive(Clone)]
 pub struct VortexServer {
@@ -231,19 +351,28 @@ impl VortexServer {
                     .clamp(1, service.config().limits.clamp_page_size(params.page_size));
                 let page = params.page.unwrap_or(1).max(1);
                 let start = (page - 1) * page_size;
-                let findings_page: Vec<_> = operation
+                let total_findings = operation.report.findings.len();
+                let findings_page: Vec<serde_json::Value> = operation
                     .report
                     .findings
                     .iter()
                     .skip(start)
                     .take(page_size)
+                    .map(|f| serde_json::to_value(f).unwrap_or_default())
                     .collect();
+                let (findings_page, byte_capped) =
+                    bounding::fit_items(findings_page, bounding::ITEM_BUDGET_BYTES);
+                let items_returned = findings_page.len();
+                let (limitations, limitations_truncated) =
+                    bounding::fit_texts(&operation.report.limitations, bounding::TEXT_BUDGET_BYTES);
+                let (unknowns, unknowns_truncated) =
+                    bounding::fit_texts(&operation.report.unknowns, bounding::TEXT_BUDGET_BYTES);
                 let payload = serde_json::json!({
                     "run_id": operation.run_id,
                     "status": operation.status.as_str(),
                     "summary": operation.report.summary,
                     "counts": {
-                        "findings": operation.report.findings.len(),
+                        "findings": total_findings,
                         "relationships": operation.report.relationships.len(),
                         "limitations": operation.report.limitations.len(),
                         "unknowns": operation.report.unknowns.len(),
@@ -255,13 +384,19 @@ impl VortexServer {
                     "pagination": {
                         "page": page,
                         "page_size": page_size,
-                        "total_items": operation.report.findings.len(),
-                        "has_next": start + page_size < operation.report.findings.len(),
+                        "total_items": total_findings,
+                        "items_returned": items_returned,
+                        "has_next": start + items_returned < total_findings,
+                        "byte_capped": byte_capped,
                         "hint": "read more pages with page/page_size, or all sections with vortex_read_evidence",
                     },
                     "findings": findings_page,
-                    "limitations": operation.report.limitations,
-                    "unknowns": operation.report.unknowns,
+                    "limitations": limitations,
+                    "limitations_total": operation.report.limitations.len(),
+                    "limitations_truncated": limitations_truncated,
+                    "unknowns": unknowns,
+                    "unknowns_total": operation.report.unknowns.len(),
+                    "unknowns_truncated": unknowns_truncated,
                 });
                 Ok(CallToolResult::structured(payload))
             }
@@ -297,18 +432,29 @@ impl VortexServer {
 
         match result {
             Ok(operation) => {
-                let matches: Vec<_> = operation
+                let matches: Vec<serde_json::Value> = operation
                     .report
                     .findings
                     .iter()
                     .filter(|finding| finding.kind == "search_match")
+                    .map(|f| serde_json::to_value(f).unwrap_or_default())
                     .collect();
+                let matches_total = matches.len();
+                let (matches, byte_capped) =
+                    bounding::fit_items(matches, bounding::ITEM_BUDGET_BYTES);
+                let (limitations, limitations_truncated) =
+                    bounding::fit_texts(&operation.report.limitations, bounding::TEXT_BUDGET_BYTES);
                 let payload = serde_json::json!({
                     "run_id": operation.run_id,
                     "status": operation.status.as_str(),
                     "summary": operation.report.summary,
                     "matches": matches,
-                    "limitations": operation.report.limitations,
+                    "matches_returned": matches.len(),
+                    "matches_total": matches_total,
+                    "byte_capped": byte_capped,
+                    "limitations": limitations,
+                    "limitations_total": operation.report.limitations.len(),
+                    "limitations_truncated": limitations_truncated,
                 });
                 Ok(CallToolResult::structured(payload))
             }
@@ -344,13 +490,20 @@ impl VortexServer {
                 let page_size = service.config().limits.clamp_page_size(params.page_size);
                 let page = params.page.unwrap_or(1).max(1);
                 let start = (page - 1) * page_size;
-                let relationships_page: Vec<_> = operation
+                let total = operation.report.relationships.len();
+                let relationships_page: Vec<serde_json::Value> = operation
                     .report
                     .relationships
                     .iter()
                     .skip(start)
                     .take(page_size)
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .collect();
+                let (relationships_page, byte_capped) =
+                    bounding::fit_items(relationships_page, bounding::ITEM_BUDGET_BYTES);
+                let items_returned = relationships_page.len();
+                let (limitations, limitations_truncated) =
+                    bounding::fit_texts(&operation.report.limitations, bounding::TEXT_BUDGET_BYTES);
                 let payload = serde_json::json!({
                     "run_id": operation.run_id,
                     "status": operation.status.as_str(),
@@ -358,11 +511,15 @@ impl VortexServer {
                     "pagination": {
                         "page": page,
                         "page_size": page_size,
-                        "total_items": operation.report.relationships.len(),
-                        "has_next": start + page_size < operation.report.relationships.len(),
+                        "total_items": total,
+                        "items_returned": items_returned,
+                        "has_next": start + items_returned < total,
+                        "byte_capped": byte_capped,
                     },
                     "relationships": relationships_page,
-                    "limitations": operation.report.limitations,
+                    "limitations": limitations,
+                    "limitations_total": operation.report.limitations.len(),
+                    "limitations_truncated": limitations_truncated,
                 });
                 Ok(CallToolResult::structured(payload))
             }
@@ -420,6 +577,10 @@ impl VortexServer {
         .await?;
         match result {
             Ok(view) => {
+                let total_items = view.page.total_items;
+                let (items, byte_capped) =
+                    bounding::fit_items(view.page.items, bounding::ITEM_BUDGET_BYTES);
+                let items_returned = items.len();
                 let payload = serde_json::json!({
                     "run": {
                         "run_id": view.run.run_id,
@@ -434,11 +595,13 @@ impl VortexServer {
                     "page": {
                         "page": view.page.page,
                         "page_size": view.page.page_size,
-                        "total_items": view.page.total_items,
+                        "total_items": total_items,
                         "total_pages": view.page.total_pages,
-                        "has_next": view.page.has_next,
+                        "items_returned": items_returned,
+                        "has_next": view.page.has_next || byte_capped,
+                        "byte_capped": byte_capped,
                     },
-                    "items": view.page.items,
+                    "items": items,
                 });
                 Ok(CallToolResult::structured(payload))
             }
@@ -490,6 +653,10 @@ impl VortexServer {
         bridge.abort();
         match result {
             Ok(operation) => {
+                let (limitations, limitations_truncated) =
+                    bounding::fit_texts(&operation.report.limitations, bounding::TEXT_BUDGET_BYTES);
+                let (unknowns, unknowns_truncated) =
+                    bounding::fit_texts(&operation.report.unknowns, bounding::TEXT_BUDGET_BYTES);
                 let payload = serde_json::json!({
                     "run_id": operation.run_id,
                     "status": operation.status.as_str(),
@@ -501,8 +668,12 @@ impl VortexServer {
                         "files_skipped": operation.report.counts.files_skipped,
                         "truncated": operation.report.counts.truncated,
                     },
-                    "limitations": operation.report.limitations,
-                    "unknowns": operation.report.unknowns,
+                    "limitations": limitations,
+                    "limitations_total": operation.report.limitations.len(),
+                    "limitations_truncated": limitations_truncated,
+                    "unknowns": unknowns,
+                    "unknowns_total": operation.report.unknowns.len(),
+                    "unknowns_truncated": unknowns_truncated,
                 });
                 Ok(CallToolResult::structured(payload))
             }
