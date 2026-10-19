@@ -22,3 +22,15 @@
 
 pub mod asar;
 pub mod zip_reader;
+
+/// The bounded outcome of reading one archive member (zip or asar).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberRead {
+    /// The member's content, fully read (`len` ≤ both caps).
+    Full(Vec<u8>),
+    /// The member is larger; only the first bytes were produced.
+    Truncated(Vec<u8>, u64),
+    /// The member could not be read at all (absent, unsupported method,
+    /// encrypted, unpacked, budget exhausted, ...).
+    Failed(String),
+}

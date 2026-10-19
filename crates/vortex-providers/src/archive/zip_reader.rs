@@ -9,6 +9,7 @@
 //! `max_archive_member_bytes` into memory and counts every produced byte
 //! against the run budget; nothing is ever written to disk.
 
+use super::MemberRead;
 use std::io::Read;
 use std::path::Path;
 use vortex_core::limits::ResourceLimits;
@@ -278,17 +279,6 @@ pub fn is_dex_member_name(name: &str) -> bool {
     } else {
         false
     }
-}
-
-/// The bounded outcome of reading one member.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberRead {
-    /// The member's content, fully read (`len` ≤ both caps).
-    Full(Vec<u8>),
-    /// The member is larger; only the first bytes were produced.
-    Truncated(Vec<u8>, u64),
-    /// The member could not be read at all.
-    Failed(String),
 }
 
 /// Read one member's decompressed content into memory, bounded by the
