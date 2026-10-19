@@ -13,19 +13,30 @@
 //!
 //! PID reuse is the classic failure mode of pid checks. On Linux the
 //! kernel exposes each process's start time (field 22 of `/proc/<pid>/stat`,
-//! clock ticks since boot); if we recorded it, a mismatch means the pid now
-//! belongs to a *different* process, so the original owner is dead. Where
-//! the start time is unavailable the check degrades to plain liveness and
-//! says so — never a guess presented as a fact.
+//! clock ticks since boot); on Windows the creation time reported by
+//! `GetProcessTimes` serves the same role. In both cases, if we recorded
+//! it, a mismatch means the pid now belongs to a *different* process, so
+//! the original owner is dead. Where the start time is unavailable the
+//! check degrades to plain liveness and says so — never a guess presented
+//! as a fact.
+//!
+//! Windows needs one extra step: a terminated process whose object is
+//! still referenced (a parent holding a `Child` handle, for example) can
+//! still be opened, so a live handle alone proves nothing. The exit time
+//! (`GetProcessTimes`) and the exit code (`GetExitCodeProcess`, where
+//! `STILL_ACTIVE` means not exited) close that gap; a process that exited
+//! with the literal code 259 would be misreported as alive — documented
+//! here rather than hidden behind a heuristic.
 
 /// Identity of the process that owns (or owned) a run record.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProcessInfo {
     /// Operating-system process id.
     pub pid: u32,
-    /// Process start time in clock ticks since boot (Linux `/proc`), when
-    /// it could be recorded. `None` means the reuse defense is unavailable
-    /// on this platform.
+    /// Process start time, when it could be recorded: clock ticks since
+    /// boot (Linux `/proc/<pid>/stat` field 22) or the process creation
+    /// time as a Windows `FILETIME` u64. `None` means the reuse defense is
+    /// unavailable on this platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proc_start: Option<u64>,
 }
@@ -72,11 +83,97 @@ pub fn owner_is_alive(info: &ProcessInfo) -> Option<bool> {
         }
         Some(true)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_owner_is_alive(info)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = info;
         None
     }
+}
+
+#[cfg(windows)]
+fn windows_owner_is_alive(info: &ProcessInfo) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    /// `STILL_ACTIVE` from processthreadsapi.h (259): the exit code a live
+    /// process reports. Not exposed by windows-sys, so declared here.
+    const STILL_ACTIVE: u32 = 259;
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, info.pid) };
+    if handle.is_null() {
+        // No handle: the pid is either not in use at all, or exists but is
+        // not ours to query — the Windows analogue of ESRCH and EPERM.
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(code)
+                if code == windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32 =>
+            {
+                Some(false)
+            }
+            Some(code) if code == windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32 => {
+                Some(true)
+            }
+            _ => None, // unexpected failure; do not guess
+        };
+    }
+
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit_time = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut _kernel = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut _user = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit_code: u32 = 0;
+    let times_ok = unsafe {
+        GetProcessTimes(
+            handle,
+            &mut creation,
+            &mut exit_time,
+            &mut _kernel,
+            &mut _user,
+        )
+    };
+    let code_ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    unsafe { CloseHandle(handle) };
+    if times_ok == 0 || code_ok == 0 {
+        return None; // could not query; do not guess
+    }
+
+    // A live process reports STILL_ACTIVE and has no exit time written.
+    // Either signal of exit is conclusive; requiring both would resurrect
+    // processes that exited with code 259 or hand out handles with stale
+    // exit-time buffers.
+    let exited =
+        exit_code != STILL_ACTIVE || exit_time.dwLowDateTime != 0 || exit_time.dwHighDateTime != 0;
+    if exited {
+        return Some(false);
+    }
+
+    // Alive (or at least present). Refuse to trust the pid when the
+    // recorded creation time no longer matches — the pid was reused.
+    if let Some(recorded_start) = info.proc_start {
+        let current_start =
+            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        if current_start != recorded_start {
+            return Some(false); // pid reused; original owner is gone
+        }
+    }
+    Some(true)
 }
 
 /// Read field 22 of `/proc/<pid>/stat` (start time in ticks since boot).
@@ -98,7 +195,46 @@ fn proc_start_of(_pid: u32) -> Option<u64> {
     None
 }
 
-#[cfg(not(unix))]
+/// Read the process creation time as a `FILETIME` u64 via `OpenProcess` +
+/// `GetProcessTimes`. Returns `None` when the process cannot be opened or
+/// queried (including when it has already exited).
+#[cfg(windows)]
+fn proc_start_of(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut _exit = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut _kernel = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut _user = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let ok =
+        unsafe { GetProcessTimes(handle, &mut creation, &mut _exit, &mut _kernel, &mut _user) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
+    }
+    Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn proc_start_of(_pid: u32) -> Option<u64> {
     None
 }
@@ -134,7 +270,21 @@ mod tests {
                 let text = String::from_utf8_lossy(&out.stdout);
                 text.trim().parse::<u32>().expect("pid")
             };
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            let pid: u32 = {
+                // `cmd /C exit 0` exits immediately; by the time wait()
+                // returns the process has terminated (the exit-time /
+                // exit-code path is exactly what the probe must catch,
+                // because the test harness still holds its handle).
+                let mut child = Command::new("cmd")
+                    .args(["/C", "exit 0"])
+                    .spawn()
+                    .expect("spawn cmd");
+                let pid = child.id();
+                let _ = child.wait().expect("wait for cmd");
+                pid
+            };
+            #[cfg(not(any(unix, windows)))]
             let pid: u32 = 0;
             if pid == 0 {
                 return; // cannot test on this platform
@@ -163,6 +313,16 @@ mod tests {
         assert!(
             me.proc_start.is_some(),
             "Linux must record /proc start times"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn proc_start_is_recorded_on_windows() {
+        let me = current();
+        assert!(
+            me.proc_start.is_some(),
+            "Windows must record process creation times"
         );
     }
 

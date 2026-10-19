@@ -21,5 +21,14 @@ time = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Process-liveness probes for crash recovery on Windows (OpenProcess +
+# GetProcessTimes / GetExitCodeProcess). Compile-time FFI declarations
+# only, no runtime engine.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
