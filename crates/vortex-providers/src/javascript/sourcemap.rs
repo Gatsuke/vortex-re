@@ -155,6 +155,13 @@ pub struct SourceMapStats {
     pub names_unusable: usize,
 }
 
+impl SourceMapStats {
+    /// `broken_by_reason` rendered for JSON payloads.
+    pub fn broken_json(&self) -> serde_json::Value {
+        serde_json::json!(&self.broken_by_reason)
+    }
+}
+
 /// A parsed source map document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceMapDoc {

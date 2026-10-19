@@ -9,6 +9,20 @@
       "status": "resolved"
     },
     {
+      "from": "dist/bundle.js",
+      "to": "src/renderer/components/button.js",
+      "kind": "maps_to_source",
+      "scope": "internal",
+      "status": "resolved"
+    },
+    {
+      "from": "dist/bundle.js",
+      "to": "src/renderer/renderer.js",
+      "kind": "maps_to_source",
+      "scope": "internal",
+      "status": "resolved"
+    },
+    {
       "from": "src/lib/config.js",
       "to": "src/lib/defaults.json",
       "kind": "requires",

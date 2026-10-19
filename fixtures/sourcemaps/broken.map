@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "file": "broken.js",
+  "sources": [
+    "only.js"
+  ],
+  "sourcesContent": [],
+  "names": [],
+  "mappings": "AAAA,ICCC"
+}

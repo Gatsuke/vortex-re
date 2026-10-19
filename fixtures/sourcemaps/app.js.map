@@ -1,0 +1,20 @@
+{
+  "version": 3,
+  "file": "app.js",
+  "sourceRoot": "",
+  "sources": [
+    "src/orig/main.js",
+    "src/orig/util.js",
+    null
+  ],
+  "sourcesContent": [
+    "// original entry for the demo bundle\nexport function makeWidget(n) { return n + 1; }\n",
+    null,
+    null
+  ],
+  "names": [
+    "makeSum",
+    "log"
+  ],
+  "mappings": "AAAA,gBCCAA,c;AACIC,oBDDJ"
+}

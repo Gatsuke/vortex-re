@@ -296,13 +296,15 @@ async fn trace_tool_returns_expected_edges() {
     .await;
     assert_eq!(result.is_error, Some(false));
     let payload = structured(&result);
-    // 15 edges: the vendored tiny-dep adds a resolved `requires` edge from
+    // 17 edges: the vendored tiny-dep adds a resolved `requires` edge from
     // src/main.js and a resolved `declares_dependency` edge from the root
-    // package, both pointing at node_modules/tiny-dep/lib/entry.js.
-    assert_eq!(payload["summary"]["relationships"], 15);
-    assert_eq!(payload["summary"]["resolved"], 10);
+    // package, both pointing at node_modules/tiny-dep/lib/entry.js; the
+    // bundle's source map adds two resolved `maps_to_source` edges from
+    // dist/bundle.js to the renderer sources it declares (Phase Four).
+    assert_eq!(payload["summary"]["relationships"], 17);
+    assert_eq!(payload["summary"]["resolved"], 12);
     assert_eq!(payload["summary"]["unresolved"], 5);
-    assert_eq!(payload["relationships"].as_array().unwrap().len(), 15);
+    assert_eq!(payload["relationships"].as_array().unwrap().len(), 17);
     shutdown(client, server_handle).await;
 }
 

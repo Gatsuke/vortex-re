@@ -474,6 +474,8 @@ fn inspect_file(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde_json:
                     }),
                 );
             }
+            // Phase Four: reconstruction through resolvable sibling maps.
+            reconstruct_bundle_sourcemaps(ctx, builder, &rel_path, &text);
         }
 
         if identification.format == "json" || identification.format == "sourcemap-json" {
@@ -497,22 +499,35 @@ fn inspect_file(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde_json:
                         }),
                     );
                     if is_sourcemap {
-                        builder.finding(
-                            "sourcemap_file",
-                            Origin::Observed,
-                            format!("{rel_path}: source map document (version/mappings present)"),
-                            Some(Location::file(&rel_path)),
-                            Some(artifact.clone()),
-                            serde_json::json!({
-                                "sources": value.get("sources").and_then(|s| s.as_array()).map(|a| a.len()),
-                            }),
-                        );
+                        // Phase Four: full structural parse of the map document.
+                        if let Some(doc) = try_parse_sourcemap(ctx, builder, &rel_path, prefix) {
+                            let pairing = SourcemapPairing {
+                                map_rel: rel_path.clone(),
+                                map_sha256: sha256.clone(),
+                                map_size: full_size,
+                                map_artifact: artifact.clone(),
+                                bundle_rel: None,
+                                bundle_lines: None,
+                            };
+                            record_sourcemap_document(ctx, builder, &rel_path, &artifact, &doc);
+                            record_sourcemap_reconstruction(ctx, builder, &doc, &pairing);
+                        }
                     }
                 }
                 Err(err) => {
                     builder.warning(format!(
                         "{rel_path}: identified as JSON by extension but parsing failed: {err}"
                     ));
+                    if identification.format == "sourcemap-json" {
+                        if let ReadOutcome::Truncated(read, total) = &outcome {
+                            builder.limitation(format!(
+                                "{rel_path}: source map read was truncated at {} of {} bytes \
+                                 (max_file_bytes); a truncated JSON map cannot be parsed",
+                                read.len(),
+                                total
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1476,6 +1491,14 @@ fn inspect_directory(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde_
                     );
                 }
             }
+            if identification.format == "sourcemap-json" {
+                // Same pattern as native binaries: the directory pass is an
+                // inventory; depth is single-file inspection.
+                builder.limitation(format!(
+                    "{rel_path}: source map structural parsing is available through \
+                     single-file inspection of this file (or of the bundle that references it)"
+                ));
+            }
             if entry.rel_path.file_name().and_then(|n| n.to_str()) == Some("package.json")
                 && manifest_reports < MAX_MANIFESTS
             {
@@ -1519,6 +1542,12 @@ fn inspect_directory(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde_
     if manifest_reports >= MAX_MANIFESTS {
         builder.limitation(format!(
             "manifest parsing stopped at {MAX_MANIFESTS} manifests (limit)"
+        ));
+    }
+    if sourcemap_refs > 0 {
+        builder.limitation(format!(
+            "{sourcemap_refs} source map reference(s) recorded in this directory pass; \
+             reconstruction requires single-file inspection"
         ));
     }
     if walk_result.truncated {
@@ -1944,6 +1973,10 @@ fn relationships_impl(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde
         "observed import statements show static references only; they do not prove runtime \
          call paths or execution order",
     );
+    builder.limitation(
+        "maps_to_source edges (from bundle source maps) restate build-time declarations; \
+         they are not verified runtime relationships",
+    );
 
     let files: Vec<(String, PathBuf, u64)> = match ctx.request.target.kind {
         vortex_core::paths::TargetKind::File => {
@@ -2065,6 +2098,11 @@ fn relationships_impl(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde
     }
 
     // Phase 2: per-file scanning.
+    // Per-run cap on source map deep parses (Phase Four): each parsed map
+    // adds maps_to_source edges; beyond the cap, references are recorded
+    // but not parsed, with one disclosure.
+    let mut maps_parsed_run = 0usize;
+    let mut maps_cap_noted = false;
     for (rel_path, abs, size) in &files {
         if ctx.stop().is_some() {
             break;
@@ -2137,7 +2175,7 @@ fn relationships_impl(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde
                 );
             }
             for map_ref in javascript::scan_source_map_refs(&text) {
-                record_sourcemap_relationship(
+                let resolved_map = record_sourcemap_relationship(
                     builder,
                     ctx.root,
                     rel_path,
@@ -2146,6 +2184,29 @@ fn relationships_impl(ctx: &mut OpContext, builder: &mut ReportBuilder) -> serde
                     map_ref.column,
                     summary_id.as_deref(),
                 );
+                let Some(map_rel) = resolved_map else {
+                    continue;
+                };
+                if maps_parsed_run < ctx.limits().max_entries {
+                    if let Some(doc) = read_and_parse_map(ctx, builder, &map_rel) {
+                        maps_parsed_run += 1;
+                        record_maps_to_source(
+                            ctx,
+                            builder,
+                            rel_path,
+                            &map_rel,
+                            &doc,
+                            summary_id.as_deref(),
+                        );
+                    }
+                } else if !maps_cap_noted {
+                    maps_cap_noted = true;
+                    builder.limitation(format!(
+                        "source map deep parsing stopped at {} map(s) (limit); later \
+                         references were recorded but not parsed",
+                        ctx.limits().max_entries
+                    ));
+                }
             }
         }
 
@@ -2441,7 +2502,7 @@ fn record_sourcemap_relationship(
     line: u32,
     column: u32,
     evidence_id: Option<&str>,
-) {
+) -> Option<String> {
     let from = Node {
         kind: "file".to_string(),
         id: rel_path.to_string(),
@@ -2461,7 +2522,7 @@ fn record_sourcemap_relationship(
             evidence_id.map(str::to_string),
             Some(Location::file_line_column(rel_path, line, column)),
         );
-        return;
+        return None;
     }
     let resolved = javascript::resolve_relative_reference(root, Path::new(rel_path), url);
     let (status, note, to_id) = classify_resolved(&resolved, url);
@@ -2479,6 +2540,9 @@ fn record_sourcemap_relationship(
         evidence_id.map(str::to_string),
         Some(Location::file_line_column(rel_path, line, column)),
     );
+    // The resolved local path, when the reference points at a real file:
+    // the caller uses it for the Phase Four deep parse (maps_to_source).
+    resolved.ok().and_then(|r| r.resolved_path)
 }
 
 fn classify_resolved(
@@ -2503,6 +2567,623 @@ fn classify_resolved(
             raw.to_string(),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// source map deep parsing (Phase Four: reconstruction)
+// ---------------------------------------------------------------------------
+
+/// Parse map bytes with the honest-degradation rules shared by every caller:
+/// problems and version notes become warnings/limitations, never silent.
+///
+/// Returns `None` when the map was refused or unparseable; the reason is
+/// already recorded on the builder.
+fn try_parse_sourcemap(
+    ctx: &OpContext,
+    builder: &mut ReportBuilder,
+    map_rel: &str,
+    bytes: &[u8],
+) -> Option<javascript::sourcemap::SourceMapDoc> {
+    if bytes.len() as u64 > ctx.limits().max_sourcemap_bytes {
+        builder.limitation(format!(
+            "{map_rel}: source map is {} bytes, above the source map budget \
+             ({}); it was not parsed",
+            bytes.len(),
+            ctx.limits().max_sourcemap_bytes
+        ));
+        return None;
+    }
+    match javascript::parse_source_map(bytes, ctx.limits().max_sourcemap_segments) {
+        Ok(doc) => {
+            for problem in &doc.problems {
+                builder.warning(format!("{map_rel}: {problem}"));
+            }
+            if let Some(note) = &doc.version_note {
+                builder.limitation(format!("{map_rel}: {note}"));
+            }
+            if let Some(stop) = &doc.mappings_stop {
+                builder.limitation(format!("{map_rel}: {stop}"));
+            }
+            for (reason, count) in &doc.stats.broken_by_reason {
+                builder.limitation(format!(
+                    "{map_rel}: {count} mapping segment(s) are unusable ({reason}); \
+                     they map nothing and are excluded from reconstruction"
+                ));
+            }
+            Some(doc)
+        }
+        Err(error) => {
+            builder.warning(format!(
+                "{map_rel}: identified as a source map but parsing failed: {}",
+                error.0
+            ));
+            builder.limitation(format!(
+                "{map_rel}: source map structure unavailable ({})",
+                error.0
+            ));
+            None
+        }
+    }
+}
+
+/// One source entry as JSON for listings (bounded by the caller).
+fn source_entry_json(doc: &javascript::sourcemap::SourceMapDoc, index: usize) -> serde_json::Value {
+    serde_json::json!({
+        "index": index,
+        "name": doc.source_at(index).map(|s| s.display()),
+        "embedded_content": match doc.sources_content_lengths.get(index) {
+            Some(Some(bytes)) => serde_json::json!({"bytes": bytes}),
+            _ => serde_json::Value::Null,
+        },
+    })
+}
+
+/// The structural document finding for a directly inspected `.map` file.
+///
+/// Returns the finding id so reconstruction can cite it as evidence.
+fn record_sourcemap_document(
+    ctx: &mut OpContext,
+    builder: &mut ReportBuilder,
+    map_rel: &str,
+    map_artifact: &ArtifactRef,
+    doc: &javascript::sourcemap::SourceMapDoc,
+) -> Option<String> {
+    let limits = ctx.limits();
+    let sources_listed = doc
+        .sources
+        .iter()
+        .enumerate()
+        .take(limits.max_entries)
+        .map(|(index, _)| source_entry_json(doc, index))
+        .collect::<Vec<_>>();
+    let names_listed: Vec<&str> = doc
+        .names
+        .iter()
+        .filter_map(|n| n.as_deref())
+        .take(limits.max_entries)
+        .collect();
+    let finding_id = builder.finding(
+        "sourcemap_document",
+        Origin::Observed,
+        format!(
+            "{map_rel}: source map (version {}), {} source(s), {} mapping segment(s)",
+            doc.version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "<missing>".into()),
+            doc.stats.sources_total,
+            doc.stats.segments_total,
+        ),
+        Some(Location::file(map_rel)),
+        Some(map_artifact.clone()),
+        serde_json::json!({
+            "version": doc.version,
+            "version_note": doc.version_note,
+            "file": doc.file,
+            "source_root": doc.source_root,
+            "sources": {
+                "total": doc.stats.sources_total,
+                "listed": sources_listed.len(),
+                "truncated": doc.stats.sources_total > limits.max_entries,
+                "entries": sources_listed,
+                "named": doc.stats.sources_named,
+                "null": doc.stats.sources_null,
+                "unusable": doc.stats.sources_unusable,
+            },
+            "names": {
+                "total": doc.stats.names_total,
+                "unusable": doc.stats.names_unusable,
+                "listed": names_listed.len(),
+                "truncated": doc.stats.names_total > limits.max_entries,
+                "entries": names_listed,
+            },
+            "sources_content": {
+                "with_content": doc.stats.sources_with_content,
+                "total_bytes": doc.stats.sources_content_bytes,
+                "note": "presence and lengths only; embedded contents are never reproduced",
+            },
+            "segments": {
+                "total": doc.stats.segments_total,
+                "mapped": doc.stats.mapped,
+                "column_only": doc.stats.column_only,
+                "broken_by_reason": doc.stats.broken_json(),
+                "stopped_early": doc.mappings_stop,
+            },
+            "generated_lines": {
+                "spanned": doc.stats.lines_spanned,
+                "with_mappings": doc.stats.lines_with_segments,
+            },
+        }),
+    );
+    if doc.stats.sources_total > limits.max_entries {
+        builder.limitation(format!(
+            "{map_rel}: source listing stopped at {} of {} entries (limit)",
+            limits.max_entries, doc.stats.sources_total
+        ));
+    }
+    if doc.stats.names_total > limits.max_entries {
+        builder.limitation(format!(
+            "{map_rel}: name listing stopped at {} of {} entries (limit)",
+            limits.max_entries, doc.stats.names_total
+        ));
+    }
+    finding_id
+}
+
+/// Position convention shared by reconstruction output.
+const RECONSTRUCTION_CONVENTION: &str = "lines are 1-based; columns are 0-based";
+
+/// The derived reconstruction finding: what the map maps, with per-mapping
+/// provenance (segment ordinals) and honest coverage accounting.
+///
+/// `pairing` carries the bundle context when the map was reached through a
+/// bundle's `sourceMappingURL` reference; `None` means the `.map` was
+/// inspected directly.
+fn record_sourcemap_reconstruction(
+    ctx: &mut OpContext,
+    builder: &mut ReportBuilder,
+    doc: &javascript::sourcemap::SourceMapDoc,
+    pairing: &SourcemapPairing,
+) -> Option<String> {
+    let limits = ctx.limits();
+    let aggregates = doc.per_source_aggregates();
+    let listed: Vec<serde_json::Value> = aggregates
+        .iter()
+        .take(limits.max_entries)
+        .map(|aggregate| {
+            serde_json::json!({
+                "index": aggregate.source_index,
+                "name": doc.source_at(aggregate.source_index).map(|s| s.display()),
+                "segments": aggregate.segment_count,
+                "first": aggregate.first.as_ref().map(agg_json),
+                "last": aggregate.last.as_ref().map(agg_json),
+                "embedded_content": match doc.sources_content_lengths.get(aggregate.source_index) {
+                    Some(Some(bytes)) => serde_json::json!({"bytes": bytes}),
+                    _ => serde_json::Value::Null,
+                },
+            })
+        })
+        .collect();
+
+    // Sample segments with full provenance: the first mappings, verbatim.
+    let mut samples: Vec<serde_json::Value> = Vec::new();
+    'outer: for line in &doc.lines {
+        for segment in &line.segments {
+            if let javascript::sourcemap::SegmentMapping::Source {
+                source_index,
+                source_line,
+                source_col,
+                name_index,
+            } = &segment.mapping
+            {
+                samples.push(serde_json::json!({
+                    "ordinal": segment.ordinal,
+                    "generated": {
+                        "line": line.line,
+                        "column": segment.gen_col,
+                        "span_end": segment.span_end,
+                    },
+                    "source": {
+                        "index": source_index,
+                        "name": doc.source_at(*source_index).map(|s| s.display()),
+                        "line": source_line,
+                        "column": source_col,
+                        "name_field": doc.name_at(*name_index),
+                    },
+                }));
+                if samples.len() >= 3 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    let mut details = serde_json::json!({
+        "convention": RECONSTRUCTION_CONVENTION,
+        "map": {
+            "path": pairing.map_rel,
+            "sha256": pairing.map_sha256,
+            "size_bytes": pairing.map_size,
+            "version": doc.version,
+            "file_field": doc.file,
+        },
+        "correspondence": pairing.correspondence_json(doc),
+        "provenance": "every mapping cites its segment ordinal in the map's \
+                        'mappings' string; ordinals are global across the document",
+        "sources": {
+            "total": aggregates.len(),
+            "listed": listed.len(),
+            "truncated": aggregates.len() > limits.max_entries,
+            "entries": listed,
+        },
+        "samples": samples,
+        "coverage": {
+            "generated_lines_spanned": doc.stats.lines_spanned,
+            "generated_lines_with_mappings": doc.stats.lines_with_segments,
+            "segments": {
+                "total": doc.stats.segments_total,
+                "mapped": doc.stats.mapped,
+                "column_only": doc.stats.column_only,
+                "broken_by_reason": doc.stats.broken_json(),
+                "stopped_early": doc.mappings_stop,
+            },
+        },
+    });
+    if let Some(bundle_lines) = pairing.bundle_lines {
+        details["coverage"]["bundle_lines"] = serde_json::json!(bundle_lines);
+        if (doc.stats.lines_spanned as u64) < bundle_lines {
+            details["coverage"]["note"] = serde_json::json!(
+                "the map's line span is shorter than the bundle's line count; \
+                 positions beyond the span report unmapped"
+            );
+        }
+    }
+
+    let finding_id = builder.finding(
+        "sourcemap_reconstruction",
+        Origin::Derived,
+        format!(
+            "{}: {} source(s) reconstruct from bundle positions; {} of {} spanned \
+             generated line(s) carry mappings",
+            pairing.map_rel,
+            aggregates.len(),
+            doc.stats.lines_with_segments,
+            doc.stats.lines_spanned,
+        ),
+        Some(Location::file(&pairing.map_rel)),
+        Some(pairing.map_artifact.clone()),
+        details,
+    );
+    if aggregates.len() > limits.max_entries {
+        builder.limitation(format!(
+            "{}: reconstruction listing stopped at {} of {} sources (limit); \
+             per-source counts above are exact for the listed entries only",
+            pairing.map_rel,
+            limits.max_entries,
+            aggregates.len()
+        ));
+    }
+    // The honesty framing every reconstruction carries, paired or not: the
+    // format has no checksum linkage, so correspondence is never verified.
+    builder.limitation(format!(
+        "{}: reconstruction restates this map's declarations; vortex cannot verify \
+         the map was generated from this exact bundle (the format carries no \
+         checksum linkage)",
+        pairing.map_rel,
+    ));
+    finding_id
+}
+
+fn agg_json(m: &javascript::sourcemap::AggMapping) -> serde_json::Value {
+    serde_json::json!({
+        "generated": {"line": m.gen_line, "column": m.gen_col},
+        "source": {"line": m.source_line, "column": m.source_col},
+        "ordinal": m.ordinal,
+    })
+}
+
+/// Context for one map that is being reconstructed: where it came from and
+/// what (if anything) it claims to describe.
+struct SourcemapPairing {
+    /// Map path relative to the root.
+    map_rel: String,
+    /// Map digest.
+    map_sha256: String,
+    /// Map size in bytes.
+    map_size: u64,
+    /// Artifact reference for the map file (findings attach to it).
+    map_artifact: ArtifactRef,
+    /// The bundle that referenced the map, when reached through a bundle.
+    bundle_rel: Option<String>,
+    /// The bundle's line count, when the map was reached through a bundle
+    /// that is in hand.
+    bundle_lines: Option<u64>,
+}
+
+impl SourcemapPairing {
+    /// The `file`-field correspondence check, as JSON.
+    fn correspondence_json(&self, doc: &javascript::sourcemap::SourceMapDoc) -> serde_json::Value {
+        match (&self.bundle_rel, &doc.file) {
+            (Some(bundle), Some(file_field)) => {
+                let bundle_name = Path::new(bundle)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(bundle);
+                if file_field == bundle_name {
+                    serde_json::json!({"check": "matches", "map_file_field": file_field, "bundle": bundle})
+                } else {
+                    serde_json::json!({
+                        "check": "mismatch",
+                        "map_file_field": file_field,
+                        "bundle": bundle,
+                        "note": "the map's 'file' field does not name this bundle; the map may \
+                                 describe a different file - reconstruction results stay tied to \
+                                 the map, not to this bundle",
+                    })
+                }
+            }
+            (Some(bundle), None) => serde_json::json!({
+                "check": "absent",
+                "bundle": bundle,
+                "note": "the map has no 'file' field; which file it describes is unverified",
+            }),
+            (None, Some(file_field)) => serde_json::json!({
+                "check": "not_applicable",
+                "map_file_field": file_field,
+                "note": "map inspected directly; no bundle pairing was requested",
+            }),
+            (None, None) => serde_json::json!({
+                "check": "not_applicable",
+                "note": "map inspected directly; no bundle pairing was requested",
+            }),
+        }
+    }
+}
+
+/// Read a local map file and parse it, honoring every budget. Shared by the
+/// bundle-paired (inspect) and relationship (maps_to_source) paths.
+///
+/// Returns `None` with the reason recorded on the builder.
+fn read_and_parse_map(
+    ctx: &mut OpContext,
+    builder: &mut ReportBuilder,
+    map_rel: &str,
+) -> Option<javascript::sourcemap::SourceMapDoc> {
+    let map_abs = ctx.root.join(map_rel);
+    let map_budget = ctx.limits().max_sourcemap_bytes;
+    let file_budget = ctx.limits().max_file_bytes;
+    let outcome = read_prefix(&map_abs, map_budget, &mut ctx.budget, file_budget);
+    match outcome {
+        ReadOutcome::Full(bytes) => try_parse_sourcemap(ctx, builder, map_rel, &bytes),
+        ReadOutcome::Truncated(bytes, full_size) => {
+            builder.limitation(format!(
+                "{map_rel}: source map is {full_size} bytes; the read was capped at {} bytes \
+                 (map budget {}, file budget {}); a truncated map cannot be parsed",
+                bytes.len(),
+                ctx.limits().max_sourcemap_bytes,
+                ctx.limits().max_file_bytes,
+            ));
+            None
+        }
+        ReadOutcome::Failed(error) => {
+            builder.warning(format!(
+                "{map_rel}: referenced map could not be read: {error}"
+            ));
+            None
+        }
+    }
+}
+
+/// Resolve a bundle's `sourceMappingURL` references to local map files and
+/// record a reconstruction finding for each parsed map. Bounded parses per
+/// bundle; unresolvable and inline references are disclosed, never guessed.
+fn reconstruct_bundle_sourcemaps(
+    ctx: &mut OpContext,
+    builder: &mut ReportBuilder,
+    bundle_rel: &str,
+    bundle_text: &str,
+) {
+    let refs = javascript::scan_source_map_refs(bundle_text);
+    let external = refs.iter().filter(|r| !r.inline).count();
+    let mut parsed = 0usize;
+    let mut unresolvable: Vec<String> = Vec::new();
+    let mut inline_count = 0usize;
+    for map_ref in &refs {
+        if parsed >= ctx.limits().max_entries {
+            break;
+        }
+        if map_ref.inline {
+            inline_count += 1;
+            continue;
+        }
+        let resolved =
+            javascript::resolve_relative_reference(ctx.root, Path::new(bundle_rel), &map_ref.url);
+        let Some(map_rel) = resolved.as_ref().ok().and_then(|r| r.resolved_path.clone()) else {
+            unresolvable.push(map_ref.url.clone());
+            continue;
+        };
+        if let Some(doc) = read_and_parse_map(ctx, builder, &map_rel) {
+            parsed += 1;
+            let map_abs = ctx.root.join(&map_rel);
+            let map_sha = sha256_file(&map_abs).unwrap_or_default();
+            let map_size = std::fs::metadata(&map_abs).map(|m| m.len()).unwrap_or(0);
+            let pairing = SourcemapPairing {
+                map_rel: map_rel.clone(),
+                map_sha256: map_sha.clone(),
+                map_size,
+                map_artifact: ArtifactRef {
+                    path: map_rel.clone(),
+                    sha256: map_sha,
+                    size_bytes: map_size,
+                },
+                bundle_rel: Some(bundle_rel.to_string()),
+                bundle_lines: Some(bundle_text.lines().count() as u64),
+            };
+            record_sourcemap_reconstruction(ctx, builder, &doc, &pairing);
+        }
+    }
+    // External references that were never examined because the parse cap
+    // hit first (inline references are counted separately and never parsed).
+    if external > parsed + unresolvable.len() {
+        // References beyond the per-bundle parse cap were never examined.
+        builder.limitation(format!(
+            "{bundle_rel}: sibling map parsing stopped at {} map(s) (limit); later \
+             references were recorded but not parsed",
+            ctx.limits().max_entries
+        ));
+    }
+    for url in &unresolvable {
+        builder.limitation(format!(
+            "{bundle_rel}: referenced source map '{url}' does not resolve to a local \
+             file; not parsed"
+        ));
+    }
+    if inline_count > 0 {
+        builder.limitation(format!(
+            "{bundle_rel}: {inline_count} inline data: URI source map reference(s) recorded \
+             but not decoded"
+        ));
+    }
+}
+
+/// Join `sourceRoot` onto a source path per the format's intent: absolute
+/// paths and absolute URLs stay as they are; otherwise sourceRoot prefixes
+/// the path (with a '/' separator unless sourceRoot already ends in one).
+fn join_source_root(source_root: &Option<String>, source_path: &str) -> String {
+    let Some(root) = source_root else {
+        return source_path.to_string();
+    };
+    if source_path.starts_with('/') || source_path.contains("://") || root.is_empty() {
+        return source_path.to_string();
+    }
+    if root.ends_with('/') {
+        format!("{root}{source_path}")
+    } else {
+        format!("{root}/{source_path}")
+    }
+}
+
+/// Add `maps_to_source` edges for one parsed map: the bundle's sources, as
+/// the map declares them, resolved on disk when possible and labeled with
+/// exactly what was and was not verified.
+fn record_maps_to_source(
+    ctx: &mut OpContext,
+    builder: &mut ReportBuilder,
+    bundle_rel: &str,
+    map_rel: &str,
+    doc: &javascript::sourcemap::SourceMapDoc,
+    evidence_id: Option<&str>,
+) {
+    let from = Node {
+        kind: "file".to_string(),
+        id: bundle_rel.to_string(),
+    };
+    let usable: Vec<usize> = (0..doc.sources.len())
+        .filter(|&index| {
+            matches!(
+                doc.source_at(index),
+                Some(javascript::sourcemap::SourceName::Named(_))
+            )
+        })
+        .collect();
+    let mut listed = 0usize;
+    for index in &usable {
+        if listed >= ctx.limits().max_entries {
+            break;
+        }
+        listed += 1;
+        let Some(javascript::sourcemap::SourceName::Named(path)) = doc.source_at(*index) else {
+            continue;
+        };
+        let joined = join_source_root(&doc.source_root, path);
+        let resolved =
+            javascript::resolve_relative_reference(ctx.root, Path::new(map_rel), &joined);
+        match resolved {
+            Ok(resolution) if resolution.resolved_path.is_some() => {
+                let target = resolution.resolved_path.clone().unwrap();
+                builder.relationship(
+                    from.clone(),
+                    Node {
+                        kind: "file".to_string(),
+                        id: target.clone(),
+                    },
+                    "maps_to_source",
+                    Scope::Internal,
+                    Resolution::Resolved,
+                    Some(format!(
+                        "listed in the source map {map_rel} (source index {index}); resolved \
+                         to this file on disk"
+                    )),
+                    Origin::Derived,
+                    evidence_id.map(str::to_string),
+                    Some(Location::file(map_rel)),
+                );
+            }
+            Ok(resolution) => {
+                let note = resolution
+                    .note
+                    .clone()
+                    .unwrap_or_else(|| "no local file matched".to_string());
+                builder.relationship(
+                    from.clone(),
+                    Node {
+                        kind: "file".to_string(),
+                        id: joined.clone(),
+                    },
+                    "maps_to_source",
+                    Scope::Internal,
+                    Resolution::Unresolved,
+                    Some(format!(
+                        "path recorded in the source map {map_rel} ('{joined}'): {note}"
+                    )),
+                    Origin::Derived,
+                    evidence_id.map(str::to_string),
+                    Some(Location::file(map_rel)),
+                );
+            }
+            Err(error) => {
+                builder.relationship(
+                    from.clone(),
+                    Node {
+                        kind: "external_resource".to_string(),
+                        id: joined.clone(),
+                    },
+                    "maps_to_source",
+                    Scope::External,
+                    Resolution::Unresolved,
+                    Some(format!(
+                        "source path '{joined}' escapes the inspection root: {}",
+                        error.message
+                    )),
+                    Origin::Derived,
+                    evidence_id.map(str::to_string),
+                    Some(Location::file(map_rel)),
+                );
+            }
+        }
+    }
+    let null_or_unusable = doc.sources.len().saturating_sub(usable.len());
+    if null_or_unusable > 0 {
+        builder.limitation(format!(
+            "{map_rel}: {null_or_unusable} source entr{} null or unusable; no \
+             maps_to_source edge was recorded for them",
+            if null_or_unusable == 1 {
+                "y is"
+            } else {
+                "ies are"
+            },
+        ));
+    }
+    if usable.len() > listed {
+        builder.limitation(format!(
+            "{map_rel}: maps_to_source listing stopped at {} of {} usable source(s) (limit)",
+            listed,
+            usable.len()
+        ));
+    }
+    builder.limitation(format!(
+        "{map_rel}: maps_to_source edges restate the source map's build-time declarations; \
+         they are not verified runtime relationships"
+    ));
 }
 
 #[cfg(test)]
